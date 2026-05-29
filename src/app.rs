@@ -1,0 +1,801 @@
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use autocxx::c_uint;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use rust_spout2::Spout;
+use windows::core::Interface;
+use windows::Win32::Foundation::{HANDLE, HWND};
+use windows::Win32::Graphics::Direct3D::D3D10_1_SRV_DIMENSION_TEXTURE2D;
+use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+use windows::Win32::Graphics::Direct3D11::*;
+use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::System::Com::{CoInitialize, CoUninitialize};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetWindowLongW, SetWindowLongW, GWL_EXSTYLE, WS_EX_NOREDIRECTIONBITMAP,
+};
+use winit::dpi::PhysicalSize;
+use winit::event::{ElementState, Event, WindowEvent};
+use winit::event_loop::ControlFlow;
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::Window;
+
+use crate::config::FrameRate;
+use crate::dx::composition::DCompResources;
+use crate::dx::constants;
+use crate::dx::device::create_dx11_device_auto;
+use crate::dx::keyed_mutex::KeyedMutexGuard;
+use crate::dx::pipeline::create_pipeline;
+use crate::dx::staging::{create_staging_texture, read_alpha_from_staging};
+use crate::dx::swapchain::create_swapchain;
+use crate::interaction;
+use crate::spout_util;
+
+struct ComGuard;
+impl ComGuard {
+    fn init() -> windows::core::Result<Self> {
+        unsafe { CoInitialize(None).ok()? };
+        log::info!("COM initialized");
+        Ok(Self)
+    }
+}
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        unsafe { CoUninitialize() };
+    }
+}
+
+struct SpoutGuard(Spout);
+impl SpoutGuard {
+    fn new(spout: Spout) -> Self {
+        Self(spout)
+    }
+    fn inner(&mut self) -> &mut Spout {
+        &mut self.0
+    }
+}
+
+struct SwapchainResources {
+    swapchain: IDXGISwapChain1,
+    rtv: ID3D11RenderTargetView,
+    staging: ID3D11Texture2D,
+    width: u32,
+    height: u32,
+}
+
+impl SwapchainResources {
+    fn new(
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+    ) -> windows::core::Result<Self> {
+        let (swapchain, rtv) = create_swapchain(device, width, height)?;
+        let staging = create_staging_texture(device, width, height)?;
+        Ok(Self { swapchain, rtv, staging, width, height })
+    }
+
+    fn rebuild(
+        &mut self,
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+    ) -> windows::core::Result<()> {
+        let (swapchain, rtv) = create_swapchain(device, width, height)?;
+        let staging = create_staging_texture(device, width, height)?;
+        self.swapchain = swapchain;
+        self.rtv = rtv;
+        self.staging = staging;
+        self.width = width;
+        self.height = height;
+        Ok(())
+    }
+}
+
+struct SenderResources {
+    tex: ID3D11Texture2D,
+    srv: ID3D11ShaderResourceView,
+    keyed_mutex: Option<IDXGIKeyedMutex>,
+    handle: *mut autocxx::c_void,
+    width: u32,
+    height: u32,
+}
+
+impl SenderResources {
+    fn open(
+        device: &ID3D11Device,
+        handle: *mut autocxx::c_void,
+    ) -> windows::core::Result<Self> {
+        let mut tex: Option<ID3D11Texture2D> = None;
+        unsafe { device.OpenSharedResource(HANDLE(handle as *mut _), &mut tex)? };
+        let tex = tex.expect("OpenSharedResource succeeded but returned None");
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { tex.GetDesc(&mut desc) };
+        log::info!(
+            "Sender texture: {}x{} Format={} Usage={} BindFlags=0x{:X} MiscFlags=0x{:X}",
+            desc.Width, desc.Height, desc.Format.0,
+            desc.Usage.0, desc.BindFlags, desc.MiscFlags
+        );
+        let mut srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC::default();
+        srv_desc.Format = desc.Format;
+        srv_desc.ViewDimension = D3D10_1_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Anonymous.Texture2D.MostDetailedMip = 0;
+        srv_desc.Anonymous.Texture2D.MipLevels = 1;
+        let mut srv = None;
+        unsafe { device.CreateShaderResourceView(&tex, Some(&srv_desc), Some(&mut srv))? }
+        let srv = srv.expect("CreateShaderResourceView succeeded but returned None");
+        let keyed_mutex = tex.cast::<IDXGIKeyedMutex>().ok();
+        log::info!(
+            "KeyedMutex: {}",
+            if keyed_mutex.is_some() { "present" } else { "none" }
+        );
+        Ok(Self {
+            tex,
+            srv,
+            keyed_mutex,
+            handle,
+            width: desc.Width,
+            height: desc.Height,
+        })
+    }
+}
+
+#[cfg(debug_assertions)]
+fn save_texture_to_bmp(
+    device: &ID3D11Device,
+    ctx: &ID3D11DeviceContext,
+    tex: &ID3D11Texture2D,
+    label: &str,
+    path: &std::path::Path,
+) {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { tex.GetDesc(&mut desc); }
+    let cap_desc = D3D11_TEXTURE2D_DESC {
+        Width: desc.Width,
+        Height: desc.Height,
+        Format: desc.Format,
+        MipLevels: 1,
+        ArraySize: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: 0,
+    };
+    let mut cap = None;
+    if unsafe { device.CreateTexture2D(&cap_desc, None, Some(&mut cap)) }.is_err() {
+        log::error!("save_texture_to_bmp: CreateTexture2D staging failed");
+        return;
+    }
+    let cap = match cap {
+        Some(c) => c,
+        None => return,
+    };
+    let src = match tex.cast::<ID3D11Resource>() {
+        Ok(r) => r,
+        Err(e) => { log::error!("cast src failed: {e:?}"); return }
+    };
+    let dst = match cap.cast::<ID3D11Resource>() {
+        Ok(r) => r,
+        Err(e) => { log::error!("cast dst failed: {e:?}"); return }
+    };
+    unsafe { ctx.CopyResource(&dst, &src); }
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    if unsafe { ctx.Map(&cap, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }.is_err() {
+        log::error!("save_texture_to_bmp: Map failed");
+        return;
+    }
+    let w = desc.Width as usize;
+    let h = desc.Height as usize;
+    let pitch = mapped.RowPitch as usize;
+    let ptr = mapped.pData as *const u8;
+    let bpp = constants::BPP_RGBA;
+    let row_bytes = w * bpp;
+    let bmp_row = (row_bytes + 3) & !3;
+    let img_size = bmp_row * h;
+    let file_size = 54 + img_size;
+    let mut bmp = Vec::with_capacity(file_size);
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&(file_size as u32).to_le_bytes());
+    bmp.extend_from_slice(&[0u8; 4]);
+    bmp.extend_from_slice(&(54u32).to_le_bytes());
+    bmp.extend_from_slice(&(40u32).to_le_bytes());
+    bmp.extend_from_slice(&(w as u32).to_le_bytes());
+    bmp.extend_from_slice(&(h as u32).to_le_bytes());
+    bmp.extend_from_slice(&[1u8, 0, 32, 0]);
+    bmp.extend_from_slice(&[0u8; 4]);
+    bmp.extend_from_slice(&(img_size as u32).to_le_bytes());
+    bmp.extend_from_slice(&[0x13u8, 0x0B, 0, 0, 0x13u8, 0x0B, 0, 0]);
+    bmp.extend_from_slice(&[0u8; 8]);
+    for y in (0..h).rev() {
+        let row_ptr = unsafe { ptr.add(y * pitch) };
+        let row = unsafe { std::slice::from_raw_parts(row_ptr, row_bytes) };
+        bmp.extend_from_slice(row);
+        let pad = bmp_row - row_bytes;
+        bmp.extend(std::iter::repeat_n(0, pad));
+    }
+    unsafe { ctx.Unmap(&cap, 0); }
+    match std::fs::write(path, &bmp) {
+        Ok(_) => log::info!("{label} saved: {path:?} ({w}x{h}, Format={})", desc.Format.0),
+        Err(e) => log::error!("Write {label} failed: {e}"),
+    }
+}
+
+#[cfg(debug_assertions)]
+fn sample_pixel(
+    device: &ID3D11Device,
+    ctx: &ID3D11DeviceContext,
+    tex: &ID3D11Texture2D,
+    x: u32,
+    y: u32,
+    label: &str,
+) {
+    let cap_desc = D3D11_TEXTURE2D_DESC {
+        Width: 1,
+        Height: 1,
+        Format: unsafe { let mut d = D3D11_TEXTURE2D_DESC::default(); tex.GetDesc(&mut d); d.Format },
+        MipLevels: 1,
+        ArraySize: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: 0,
+    };
+    let mut cap = None;
+    if unsafe { device.CreateTexture2D(&cap_desc, None, Some(&mut cap)) }.is_err() { return; }
+    if let Some(cap) = cap {
+        let src = tex.cast::<ID3D11Resource>().ok();
+        let dst = cap.cast::<ID3D11Resource>().ok();
+        if let (Some(s), Some(d)) = (src, dst) {
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { tex.GetDesc(&mut desc); }
+            let box0 = D3D11_BOX { left: x, top: y, front: 0, right: x + 1, bottom: y + 1, back: 1 };
+            unsafe { ctx.CopySubresourceRegion(&d, 0, 0, 0, 0, &s, 0, Some(&box0)); }
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            if unsafe { ctx.Map(&cap, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }.is_ok() {
+                let ptr = mapped.pData as *const u8;
+                let b = unsafe { *ptr };
+                let g = unsafe { *ptr.offset(1) };
+                let r = unsafe { *ptr.offset(2) };
+                let a = unsafe { *ptr.offset(3) };
+                log::info!("{label} pixel({x},{y}) BGRA=({b}, {g}, {r}, {a})");
+                unsafe { ctx.Unmap(&cap, 0); }
+            }
+        }
+    }
+}
+
+fn init_spout(device: &ID3D11Device) -> Result<SpoutGuard, String> {
+    let spout = Spout::new().ok_or("Spout2 init failed")?;
+    let mut spout = SpoutGuard::new(spout);
+    log::info!("Spout2 initialized");
+    let raw_dev = device.as_raw() as *mut autocxx::c_void;
+    if !unsafe { spout.inner().as_pin_mut().OpenDirectX11(raw_dev) } {
+        return Err("OpenDirectX11 failed".into());
+    }
+    log::info!("OpenDirectX11 OK");
+    let senders = spout_util::list_senders(spout.inner());
+    log::info!("Senders: {senders:?}");
+    if senders.is_empty() {
+        return Err("No Spout2 senders found. Please start a sender first.".into());
+    }
+    let sender_name = senders[0].clone();
+    if !spout_util::spout_connect(spout.inner(), &sender_name)
+        .map_err(|e| format!("Connection error: {e}"))?
+    {
+        return Err(format!("Connection to '{sender_name}' timed out"));
+    }
+    log::info!("Connected to '{sender_name}'");
+    Ok(spout)
+}
+
+struct AppInit {
+    #[allow(dead_code)]
+    com_guard: ComGuard,
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    spout: SpoutGuard,
+    sender: SenderResources,
+    swapchain_res: SwapchainResources,
+    pipeline: crate::dx::pipeline::Pipeline,
+}
+
+fn init_app() -> Result<AppInit, String> {
+    let com_guard = ComGuard::init().map_err(|e| format!("COM init: {e:?}"))?;
+
+    let (device, context) =
+        create_dx11_device_auto().map_err(|e| format!("DX11 device: {e:?}"))?;
+    log::info!("DX11 device OK");
+
+    let mut spout = init_spout(&device)?;
+
+    let raw_handle = spout.inner().as_pin_mut().GetSenderHandle();
+    if raw_handle.is_null() || raw_handle == (-1isize as *mut autocxx::c_void) {
+        return Err("GetSenderHandle returned null/invalid".into());
+    }
+    log::info!("Shared handle={raw_handle:?}");
+
+    let sender = SenderResources::open(&device, raw_handle)
+        .map_err(|e| format!("OpenSharedResource: {e:?}"))?;
+
+    #[cfg(debug_assertions)]
+    {
+        let exe_dir = std::env::current_exe()
+            .map_err(|e| format!("exe path: {e}"))?
+            .parent()
+            .ok_or("no parent")?
+            .to_path_buf();
+        save_texture_to_bmp(&device, &context, &sender.tex, "SenderTexture",
+                            &exe_dir.join("debug_01_sender_texture.bmp"));
+        sample_pixel(&device, &context, &sender.tex,
+                     sender.width / 2, sender.height / 2, "SenderCenter");
+    }
+
+    let pipeline = create_pipeline(&device).map_err(|e| format!("Pipeline: {e:?}"))?;
+    log::info!("Pipeline OK");
+
+    let swapchain_res = SwapchainResources::new(&device, sender.width, sender.height)
+        .map_err(|e| format!("Swapchain: {e:?}"))?;
+    log::info!("Swapchain OK ({}x{})", sender.width, sender.height);
+
+    Ok(AppInit {
+        com_guard,
+        device,
+        context,
+        spout,
+        sender,
+        swapchain_res,
+        pipeline,
+    })
+}
+
+fn render_frame(
+    context: &ID3D11DeviceContext,
+    pipeline: &crate::dx::pipeline::Pipeline,
+    srv: &ID3D11ShaderResourceView,
+    rtv: &ID3D11RenderTargetView,
+    width: u32,
+    height: u32,
+) {
+    unsafe {
+        context.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+        context.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 0.0]);
+        context.RSSetViewports(Some(&[D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: width as f32,
+            Height: height as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        }]));
+        context.RSSetState(&pipeline.raster_state);
+        context.VSSetShader(&pipeline.vs, None);
+        context.PSSetShader(&pipeline.ps, None);
+        context.PSSetShaderResources(0, Some(&[Some(srv.clone())]));
+        context.PSSetSamplers(0, Some(&[Some(pipeline.sampler.clone())]));
+        context.IASetInputLayout(None);
+        context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context.Draw(3, 0);
+    }
+}
+
+fn clear_frame(context: &ID3D11DeviceContext, rtv: &ID3D11RenderTargetView) {
+    unsafe {
+        context.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+        context.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 0.0]);
+    }
+}
+
+fn update_alpha(
+    context: &ID3D11DeviceContext,
+    swapchain_res: &SwapchainResources,
+    interaction_state: &mut interaction::InteractionState,
+    alpha_buf: &mut Vec<u8>,
+) {
+    if let Ok(bb) = unsafe { swapchain_res.swapchain.GetBuffer::<ID3D11Texture2D>(0) } {
+        let dst = swapchain_res.staging.cast::<ID3D11Resource>().ok();
+        let src = bb.cast::<ID3D11Resource>().ok();
+        if let (Some(d), Some(s)) = (dst, src) {
+            unsafe { context.CopyResource(&d, &s); }
+            read_alpha_from_staging(
+                context,
+                &swapchain_res.staging,
+                swapchain_res.width,
+                swapchain_res.height,
+                alpha_buf,
+            );
+            if !alpha_buf.is_empty() {
+                let w = swapchain_res.width;
+                let h = swapchain_res.height;
+                interaction_state.update_alpha_mask(
+                    std::mem::take(alpha_buf),
+                    w,
+                    h,
+                );
+            }
+        }
+    }
+}
+
+struct RenderState {
+    spout: SpoutGuard,
+    sender: Option<SenderResources>,
+    swapchain_res: Option<SwapchainResources>,
+    pipeline: crate::dx::pipeline::Pipeline,
+    frame_count: u64,
+    last_fail_time: Instant,
+    first_render_logged: bool,
+    base_width: u32,
+    base_height: u32,
+    current_handle: *mut autocxx::c_void,
+    last_scale: f32,
+    alpha_buf: Vec<u8>,
+    frame_rate: FrameRate,
+    last_render_time: Instant,
+}
+
+impl RenderState {
+    fn should_render(&self, has_new_frame: bool) -> bool {
+        if !has_new_frame {
+            return false;
+        }
+        match self.frame_rate.interval() {
+            None => true,
+            Some(interval) => self.last_render_time.elapsed() >= interval,
+        }
+    }
+}
+
+pub fn run() -> Result<(), String> {
+    log::info!("=== Spout Transparent ===");
+    spout_util::extract_spout_dll().map_err(|e| format!("DLL extract: {e}"))?;
+
+    let app_init = init_app()?;
+
+    #[allow(deprecated)]
+    let event_loop = winit::event_loop::EventLoop::new().map_err(|e| format!("EventLoop: {e:?}"))?;
+    #[allow(deprecated)]
+    let window = event_loop
+        .create_window(
+            Window::default_attributes()
+                .with_title("Spout Receiver (Transparent)")
+                .with_inner_size(winit::dpi::LogicalSize::new(
+                    app_init.sender.width as f64,
+                    app_init.sender.height as f64,
+                ))
+                .with_transparent(true)
+                .with_decorations(false),
+        )
+        .map_err(|e| format!("Window: {e:?}"))?;
+    window.set_visible(false);
+
+    let hwnd = match window.window_handle().map_err(|e| format!("handle: {e:?}"))?.as_raw() {
+        RawWindowHandle::Win32(h) => HWND(h.hwnd.get() as *mut _),
+        _ => return Err("Unsupported window handle".into()),
+    };
+    log::info!("Window OK, HWND={hwnd:?}");
+
+    unsafe {
+        let ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        SetWindowLongW(hwnd, GWL_EXSTYLE, ex | (WS_EX_NOREDIRECTIONBITMAP.0 as i32));
+    }
+
+    interaction::InteractionState::init_window_style(hwnd);
+
+    let hotkey_path = if std::path::Path::new("hotkeys.json").exists() {
+        PathBuf::from("hotkeys.json")
+    } else {
+        std::env::current_exe()
+            .map_err(|e| format!("exe: {e}"))?
+            .parent()
+            .ok_or("no parent")?
+            .join("hotkeys.json")
+    };
+    if hotkey_path.exists() {
+        interaction::load_hotkey_config(&hotkey_path, hwnd)
+            .map_err(|e| format!("Hotkey config: {e}"))?;
+    } else {
+        interaction::register_default_hotkeys(hwnd)
+            .map_err(|e| format!("Hotkey register: {e}"))?;
+    }
+    interaction::install_hotkey_subclass(hwnd)
+        .map_err(|e| format!("Hotkey subclass: {e}"))?;
+    log::info!("Hotkeys OK");
+
+    let dxgi_device: IDXGIDevice =
+        app_init.device.cast().map_err(|e| format!("IDXGIDevice: {e:?}"))?;
+    let dcomp = crate::dx::composition::setup_dcomp(&dxgi_device, hwnd)
+        .map_err(|e| format!("DComp setup: {e:?}"))?;
+
+    let _ = window.request_inner_size(PhysicalSize::new(app_init.sender.width, app_init.sender.height));
+
+    unsafe {
+        let _ = dcomp.root_visual.SetContent(&app_init.swapchain_res.swapchain);
+        let _ = dcomp.device.Commit();
+    }
+
+    unsafe {
+        context_clear_present(&app_init.context, &app_init.swapchain_res, &dcomp);
+    }
+    log::info!("Initial frame presented");
+
+    #[cfg(debug_assertions)]
+    {
+        let ex = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) };
+        log::info!(
+            "ExStyle=0x{ex:X} LAYERED={} TRANSPARENT={} NOREDIR={}",
+            (ex & constants::EXSTYLE_LAYERED) != 0,
+            (ex & constants::EXSTYLE_TRANSPARENT) != 0,
+            (ex & constants::EXSTYLE_NOREDIRECTIONBITMAP) != 0,
+        );
+    }
+
+    let mut interaction_state = interaction::InteractionState::new();
+    interaction_state
+        .install_mouse_hook(hwnd)
+        .map_err(|e| format!("Mouse hook: {e}"))?;
+    log::info!("InteractionState OK");
+
+    window.set_visible(true);
+    log::info!("=== Entering render loop ===");
+
+    let context = app_init.context.clone();
+    let device = app_init.device.clone();
+    let dcomp_device = dcomp.device.clone();
+    let root_visual = dcomp.root_visual.clone();
+
+    let init_handle = app_init.sender.handle;
+    let init_w = app_init.sender.width;
+    let init_h = app_init.sender.height;
+
+    let mut rs = RenderState {
+        spout: app_init.spout,
+        sender: Some(app_init.sender),
+        swapchain_res: Some(app_init.swapchain_res),
+        pipeline: app_init.pipeline,
+        frame_count: 0,
+        last_fail_time: Instant::now(),
+        first_render_logged: false,
+        base_width: init_w,
+        base_height: init_h,
+        current_handle: init_handle,
+        last_scale: interaction_state.scale_factor,
+        alpha_buf: Vec::new(),
+        frame_rate: FrameRate::Unlimited,
+        last_render_time: Instant::now(),
+    };
+
+    #[allow(deprecated)]
+    event_loop
+        .run(move |event, elwt| {
+            elwt.set_control_flow(ControlFlow::Poll);
+            match event {
+                Event::WindowEvent { event, .. } => match event {
+                    WindowEvent::CloseRequested => {
+                        interaction_state.cleanup(hwnd);
+                        elwt.exit();
+                    }
+                    WindowEvent::ModifiersChanged(mods) => {
+                        interaction_state.update_modifiers(mods.state());
+                    }
+                    WindowEvent::KeyboardInput { event: ref ke, .. } => {
+                        if ke.state == ElementState::Pressed
+                            && !ke.repeat
+                            && ke.physical_key == PhysicalKey::Code(KeyCode::Escape)
+                        {
+                            interaction_state.cleanup(hwnd);
+                            elwt.exit();
+                            return;
+                        }
+                        interaction_state.handle_keyboard(ke, hwnd);
+                    }
+                    WindowEvent::MouseWheel { delta, .. } => {
+                        interaction_state.handle_scroll(
+                            delta,
+                            &window,
+                            rs.base_width as f32,
+                            rs.base_height as f32,
+                        );
+                    }
+                    WindowEvent::MouseInput { state, button, .. } => {
+                        interaction_state.handle_mouse_input(state, button, &window);
+                    }
+                    WindowEvent::CursorMoved { position, .. } => {
+                        interaction_state.handle_cursor_moved(position, &window);
+                    }
+                    _ => {}
+                },
+                Event::AboutToWait => {
+                    for ev in interaction_state.poll_hook_events() {
+                        interaction::handle_passthrough_event(&ev, hwnd);
+                    }
+
+                    if interaction::poll_quit() {
+                        interaction_state.cleanup(hwnd);
+                        elwt.exit();
+                        return;
+                    }
+                    if interaction::poll_toggle_interaction() {
+                        interaction_state.toggle_enabled(hwnd);
+                    }
+                    if interaction::poll_toggle_topmost() {
+                        interaction_state.toggle_topmost(hwnd);
+                    }
+                    if interaction::poll_cycle_framerate() {
+                        rs.frame_rate = rs.frame_rate.cycle();
+                        log::info!("Frame rate: {}", rs.frame_rate.display_name());
+                    }
+
+                    let recv = rs.spout.inner().as_pin_mut().ReceiveTexture(
+                        c_uint(0), c_uint(0), true, c_uint(0),
+                    );
+                    rs.frame_count += 1;
+
+                    let new_handle = rs.spout.inner().as_pin_mut().GetSenderHandle();
+                    let handle_ok = !new_handle.is_null()
+                        && new_handle != (-1isize as *mut autocxx::c_void);
+                    let cooldown = rs.last_fail_time.elapsed() > Duration::from_millis(500);
+
+                    if rs.frame_count <= 3 || rs.frame_count.is_multiple_of(300) {
+                        log::debug!(
+                            "[Frame {}] recv={} handle_valid={} same={}",
+                            rs.frame_count, recv, handle_ok, new_handle == rs.current_handle
+                        );
+                    }
+
+                    if handle_ok && cooldown && new_handle != rs.current_handle {
+                        log::info!("[Frame {}] Handle changed, rebuilding...", rs.frame_count);
+                        let old_sender = rs.sender.take();
+                        if let Some(mut sr) = rs.swapchain_res.take() {
+                            match handle_sender_change(
+                                &device,
+                                new_handle,
+                                &mut sr,
+                            ) {
+                                Ok(new_sender) => {
+                                    rs.base_width = new_sender.width;
+                                    rs.base_height = new_sender.height;
+                                    interaction_state.scale_factor = 1.0;
+                                    rs.last_scale = 1.0;
+                                    unsafe {
+                                        let _ = root_visual.SetContent(&sr.swapchain);
+                                        let _ = dcomp_device.Commit();
+                                    }
+                                    let _ = window.request_inner_size(
+                                        PhysicalSize::new(sr.width, sr.height),
+                                    );
+                                    rs.swapchain_res = Some(sr);
+                                    rs.sender = Some(new_sender);
+                                    rs.current_handle = new_handle;
+                                    drop(old_sender);
+                                    log::info!("[Frame {}] Texture rebuild complete", rs.frame_count);
+                                }
+                                Err(e) => {
+                                    log::error!("Rebuild failed: {e:?}");
+                                    rs.sender = old_sender;
+                                    rs.swapchain_res = Some(sr);
+                                    rs.last_fail_time = Instant::now();
+                                }
+                            }
+                        }
+                    }
+
+                    let should_render = rs.should_render(recv);
+
+                    if let (Some(sr), Some(sn)) = (rs.swapchain_res.as_mut(), rs.sender.as_ref()) {
+                        let target_w = (rs.base_width as f32 * interaction_state.scale_factor) as u32;
+                        let target_h = (rs.base_height as f32 * interaction_state.scale_factor) as u32;
+
+                        if (rs.last_scale - interaction_state.scale_factor).abs() > f32::EPSILON
+                            && (target_w != sr.width || target_h != sr.height)
+                        {
+                            rs.last_scale = interaction_state.scale_factor;
+                            if sr.rebuild(&device, target_w, target_h).is_ok() {
+                                unsafe {
+                                    let _ = root_visual.SetContent(&sr.swapchain);
+                                    let _ = dcomp_device.Commit();
+                                }
+                                let _ = window.request_inner_size(
+                                    PhysicalSize::new(target_w, target_h),
+                                );
+                            }
+                        }
+
+                        if should_render {
+                            let _guard = sn.keyed_mutex.as_ref().and_then(|km| {
+                                KeyedMutexGuard::try_acquire(km)
+                            });
+
+                            render_frame(
+                                &context,
+                                &rs.pipeline,
+                                &sn.srv,
+                                &sr.rtv,
+                                sr.width,
+                                sr.height,
+                            );
+
+                            #[cfg(debug_assertions)]
+                            if !rs.first_render_logged {
+                                log::info!("[First frame] Draw complete");
+                                if let Ok(bb) = unsafe {
+                                    sr.swapchain.GetBuffer::<ID3D11Texture2D>(0)
+                                } {
+                                    let exe_dir = std::env::current_exe()
+                                        .ok()
+                                        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+                                        .unwrap_or_default();
+                                    save_texture_to_bmp(
+                                        &device, &context, &bb, "BackBuffer",
+                                        &exe_dir.join("debug_02_backbuffer_after_draw.bmp"),
+                                    );
+                                    sample_pixel(&device, &context, &bb,
+                                                 sr.width / 2, sr.height / 2, "BB center");
+                                }
+                                let ex = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) };
+                                log::info!(
+                                    "ExStyle=0x{ex:X} LAYERED={} TRANSPARENT={} NOREDIR={}",
+                                    (ex & constants::EXSTYLE_LAYERED) != 0,
+                                    (ex & constants::EXSTYLE_TRANSPARENT) != 0,
+                                    (ex & constants::EXSTYLE_NOREDIRECTIONBITMAP) != 0,
+                                );
+                                rs.first_render_logged = true;
+                            }
+
+                            rs.last_render_time = Instant::now();
+                        }
+
+                        if interaction_state.should_update_alpha() {
+                            update_alpha(&context, sr, &mut interaction_state, &mut rs.alpha_buf);
+                        }
+                    } else if let Some(sr) = rs.swapchain_res.as_ref() {
+                        clear_frame(&context, &sr.rtv);
+                    }
+
+                    if let Some(sr) = rs.swapchain_res.as_ref() {
+                        let _ = unsafe { sr.swapchain.Present(1, DXGI_PRESENT(0)) };
+                    }
+
+                    if !recv {
+                        let sleep_dur = match rs.frame_rate.interval() {
+                            Some(interval) => {
+                                let remaining = interval.saturating_sub(rs.last_render_time.elapsed());
+                                remaining.min(Duration::from_millis(2))
+                            }
+                            None => Duration::from_millis(1),
+                        };
+                        if !sleep_dur.is_zero() {
+                            std::thread::sleep(sleep_dur);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        })
+        .map_err(|e| format!("EventLoop: {e:?}"))?;
+
+    Ok(())
+}
+
+fn handle_sender_change(
+    device: &ID3D11Device,
+    new_handle: *mut autocxx::c_void,
+    swapchain_res: &mut SwapchainResources,
+) -> windows::core::Result<SenderResources> {
+    let new_sender = SenderResources::open(device, new_handle)?;
+    if new_sender.width != swapchain_res.width || new_sender.height != swapchain_res.height {
+        swapchain_res.rebuild(device, new_sender.width, new_sender.height)?;
+    }
+    Ok(new_sender)
+}
+
+unsafe fn context_clear_present(
+    context: &ID3D11DeviceContext,
+    sr: &SwapchainResources,
+    dcomp: &DCompResources,
+) {
+    context.OMSetRenderTargets(Some(&[Some(sr.rtv.clone())]), None);
+    context.ClearRenderTargetView(&sr.rtv, &[0.0, 0.0, 0.0, 0.0]);
+    let _ = sr.swapchain.Present(0, DXGI_PRESENT(0));
+    let _ = dcomp.device.Commit();
+}
