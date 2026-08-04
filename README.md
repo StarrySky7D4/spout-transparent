@@ -4,6 +4,8 @@
 
 接收端完全由 Rust 实现，直接使用 Win32 共享内存和 Direct3D 11 API；运行时不需要 `SpoutLibrary.dll`，构建时也不需要 CMake、LLVM/libclang 或 C++ Spout SDK。
 
+项目成果与交互演示可直接打开 [`showcase.html`](showcase.html) 查看。
+
 ## 功能
 
 - 自动连接当前排序后的第一个有效 Spout Sender，也可从托盘手动切换
