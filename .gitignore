@@ -2,10 +2,10 @@
 *.pdb
 *.exe
 *.dll
-!SpoutLibrary.dll
 *.exp
 *.lib
 *.obj
 *.ilk
 .cargo/
 *.log
+debug_*.bmp

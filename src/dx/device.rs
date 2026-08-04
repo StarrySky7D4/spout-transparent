@@ -30,5 +30,8 @@ fn create_dx11_device(
             Some(&mut context),
         )?;
     }
-    Ok((device.unwrap(), context.unwrap()))
+    Ok((
+        device.ok_or_else(crate::dx::missing_object)?,
+        context.ok_or_else(crate::dx::missing_object)?,
+    ))
 }
