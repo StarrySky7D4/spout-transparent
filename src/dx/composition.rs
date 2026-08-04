@@ -24,5 +24,9 @@ pub fn setup_dcomp(dxgi_device: &IDXGIDevice, hwnd: HWND) -> windows::core::Resu
     unsafe { target.SetRoot(&root_visual)? };
     log::info!("SetRoot OK");
 
-    Ok(DCompResources { device, target, root_visual })
+    Ok(DCompResources {
+        device,
+        target,
+        root_visual,
+    })
 }

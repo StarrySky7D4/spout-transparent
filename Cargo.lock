@@ -1751,7 +1751,6 @@ name = "spout-transparent"
 version = "0.1.0"
 dependencies = [
  "autocxx",
- "clang-sys",
  "env_logger",
  "log",
  "raw-window-handle",

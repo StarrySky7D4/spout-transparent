@@ -9,7 +9,10 @@ impl<'a> KeyedMutexGuard<'a> {
     pub fn try_acquire(mutex: &'a IDXGIKeyedMutex) -> Option<Self> {
         let acquired = unsafe { mutex.AcquireSync(0, 0) }.is_ok();
         if acquired {
-            Some(Self { mutex, acquired: true })
+            Some(Self {
+                mutex,
+                acquired: true,
+            })
         } else {
             None
         }

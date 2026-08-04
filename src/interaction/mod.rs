@@ -1,17 +1,16 @@
 mod hook_thread;
 
+pub use hook_thread::{handle_passthrough_event, MouseHook, PassthroughEvent};
 use serde::Deserialize;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-pub use hook_thread::{MouseHook, PassthroughEvent, handle_passthrough_event};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, MOD_SHIFT};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetWindowLongW, SetWindowLongW, SetWindowPos,
-    GWL_EXSTYLE, HWND_NOTOPMOST, HWND_TOPMOST,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_LAYERED, WS_EX_TRANSPARENT,
+    GetCursorPos, GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_EXSTYLE, HWND_NOTOPMOST,
+    HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_LAYERED, WS_EX_TRANSPARENT,
 };
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta};
@@ -27,6 +26,8 @@ extern "system" {
 const MIN_SCALE: f32 = 0.1;
 const MAX_SCALE: f32 = 5.0;
 const SCALE_STEP: f32 = 0.05;
+const MAX_RENDER_DIMENSION: u32 = 16_384;
+const MOD_NOREPEAT_FLAG: u32 = 0x4000;
 pub const ALPHA_UPDATE_INTERVAL: u32 = 15;
 pub const ALPHA_THRESHOLD: u8 = 10;
 const WM_HOTKEY_MSG: u32 = 0x0312;
@@ -88,12 +89,16 @@ fn parse_modifiers(mods: &[String]) -> Option<u32> {
             _ => return None,
         }
     }
-    Some(flags)
+    Some(flags | MOD_NOREPEAT_FLAG)
 }
 
 fn parse_vk(key: &str) -> Option<u32> {
     let upper = key.to_uppercase();
-    let c = upper.chars().next()?;
+    let mut chars = upper.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
     if c.is_ascii_alphabetic() || c.is_ascii_digit() {
         Some(c as u32)
     } else {
@@ -114,20 +119,25 @@ fn parse_action(action: &str) -> Option<HotKeyAction> {
 fn parse_and_register(config_str: &str, hwnd: HWND) -> Result<(), InteractionError> {
     let config: HotKeyConfig =
         serde_json::from_str(config_str).map_err(|e| InteractionError::Config(e.to_string()))?;
-    unregister_all_hotkeys(hwnd);
-    let mut new_hotkeys = Vec::new();
-    let mut registered_ids = Vec::new();
+    let mut parsed_hotkeys = Vec::with_capacity(config.hotkeys.len());
     for (i, raw) in config.hotkeys.iter().enumerate() {
-        let mod_flags = parse_modifiers(&raw.modifiers).ok_or_else(|| {
-            InteractionError::Config(format!("Invalid modifiers in hotkey {i}"))
-        })?;
+        let mod_flags = parse_modifiers(&raw.modifiers)
+            .ok_or_else(|| InteractionError::Config(format!("Invalid modifiers in hotkey {i}")))?;
         let vk = parse_vk(&raw.key).ok_or_else(|| {
             InteractionError::Config(format!("Unknown key '{}' in hotkey {}", raw.key, i))
         })?;
         let action = parse_action(&raw.action).ok_or_else(|| {
             InteractionError::Config(format!("Unknown action '{}' in hotkey {}", raw.action, i))
         })?;
-        let id = (i as i32) + 1;
+        let id = i32::try_from(i + 1)
+            .map_err(|_| InteractionError::Config("Too many hotkeys".into()))?;
+        parsed_hotkeys.push((id, mod_flags, vk, action));
+    }
+
+    unregister_all_hotkeys(hwnd);
+    let mut new_hotkeys = Vec::with_capacity(parsed_hotkeys.len());
+    let mut registered_ids = Vec::with_capacity(parsed_hotkeys.len());
+    for (id, mod_flags, vk, action) in parsed_hotkeys {
         let res = unsafe { RegisterHotKey(hwnd, id, mod_flags, vk) };
         if res == 0 {
             for rid in &registered_ids {
@@ -263,9 +273,7 @@ impl InteractionState {
             SetWindowLongW(
                 hwnd,
                 GWL_EXSTYLE,
-                ex_style
-                    | (WS_EX_LAYERED.0 as i32)
-                    | (WS_EX_TRANSPARENT.0 as i32),
+                ex_style | (WS_EX_LAYERED.0 as i32) | (WS_EX_TRANSPARENT.0 as i32),
             );
         }
     }
@@ -320,13 +328,7 @@ impl InteractionState {
         update_topmost(hwnd, self.topmost);
     }
 
-    pub fn handle_scroll(
-        &mut self,
-        delta: MouseScrollDelta,
-        window: &Window,
-        base_w: f32,
-        base_h: f32,
-    ) {
+    pub fn handle_scroll(&mut self, delta: MouseScrollDelta) {
         if !self.enabled {
             return;
         }
@@ -339,9 +341,15 @@ impl InteractionState {
         } else if delta_y < 0.0 {
             self.scale_factor = (self.scale_factor / (1.0 + SCALE_STEP)).max(MIN_SCALE);
         }
-        let new_w = (base_w * self.scale_factor) as u32;
-        let new_h = (base_h * self.scale_factor) as u32;
-        let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(new_w, new_h));
+    }
+
+    pub fn scaled_size(&self, base_w: u32, base_h: u32) -> winit::dpi::PhysicalSize<u32> {
+        let scaled = |value: u32| {
+            (value as f64 * self.scale_factor as f64)
+                .round()
+                .clamp(1.0, MAX_RENDER_DIMENSION as f64) as u32
+        };
+        winit::dpi::PhysicalSize::new(scaled(base_w), scaled(base_h))
     }
 
     pub fn handle_mouse_input(
@@ -369,15 +377,13 @@ impl InteractionState {
         }
     }
 
-    pub fn handle_cursor_moved(
-        &mut self,
-        position: PhysicalPosition<f64>,
-        window: &Window,
-    ) {
+    pub fn handle_cursor_moved(&mut self, position: PhysicalPosition<f64>, window: &Window) {
         if !self.enabled || !self.dragging {
             return;
         }
-        let Ok(outer) = window.outer_position() else { return };
+        let Ok(outer) = window.outer_position() else {
+            return;
+        };
         let cur_x = outer.x + position.x as i32;
         let cur_y = outer.y + position.y as i32;
         let dx = cur_x - self.drag_start_screen.0;
@@ -432,6 +438,32 @@ fn update_topmost(hwnd: HWND, topmost: bool) {
             0,
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn virtual_key_requires_exactly_one_character() {
+        assert_eq!(parse_vk("a"), Some('A' as u32));
+        assert_eq!(parse_vk("7"), Some('7' as u32));
+        assert_eq!(parse_vk("AB"), None);
+        assert_eq!(parse_vk(""), None);
+    }
+
+    #[test]
+    fn scaled_size_never_becomes_zero() {
+        let mut state = InteractionState::new();
+        state.scale_factor = MIN_SCALE;
+        assert_eq!(state.scaled_size(1, 1), winit::dpi::PhysicalSize::new(1, 1));
+
+        state.scale_factor = MAX_SCALE;
+        assert_eq!(
+            state.scaled_size(u32::MAX, u32::MAX),
+            winit::dpi::PhysicalSize::new(MAX_RENDER_DIMENSION, MAX_RENDER_DIMENSION)
         );
     }
 }

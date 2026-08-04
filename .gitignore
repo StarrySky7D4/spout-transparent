@@ -9,3 +9,4 @@
 *.ilk
 .cargo/
 *.log
+debug_*.bmp

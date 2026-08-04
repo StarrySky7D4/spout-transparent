@@ -1,6 +1,6 @@
 use autocxx::{c_int, c_uint};
 use rust_spout2::Spout;
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{c_char, CString};
 use std::thread;
 use std::time::Duration;
 
@@ -29,14 +29,16 @@ pub fn list_senders(spout: &mut Spout) -> Vec<String> {
     let mut senders = Vec::new();
     for i in 0..count {
         let mut buf = [0u8; 256];
-        unsafe {
+        let found = unsafe {
             spout
                 .as_pin_mut()
-                .GetSender(c_int(i), buf.as_mut_ptr() as *mut c_char, c_int(256));
+                .GetSender(c_int(i), buf.as_mut_ptr() as *mut c_char, c_int(256))
+        };
+        if !found {
+            continue;
         }
-        let name = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) }
-            .to_string_lossy()
-            .into_owned();
+        let end = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
+        let name = String::from_utf8_lossy(&buf[..end]).into_owned();
         if !name.is_empty() {
             senders.push(name);
         }

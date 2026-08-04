@@ -9,8 +9,7 @@ mod spout_util;
 #[cfg(debug_assertions)]
 fn attach_console() {
     use windows::Win32::System::Console::{
-        AllocConsole, GetConsoleMode, GetStdHandle, SetConsoleMode, CONSOLE_MODE,
-        STD_OUTPUT_HANDLE,
+        AllocConsole, GetConsoleMode, GetStdHandle, SetConsoleMode, CONSOLE_MODE, STD_OUTPUT_HANDLE,
     };
     const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
     unsafe {

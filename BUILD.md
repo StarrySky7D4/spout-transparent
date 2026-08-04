@@ -1,105 +1,88 @@
-# spout-transparent 构建与运行说明
+# spout-transparent 构建与运行
 
-## 前置条件
+## 环境要求
 
-- Rust 工具链（当前使用 `rustc 1.95.0`）
-- Visual Studio 2022 (含 C++ 桌面开发工作负载)
-- CMake（已在 VS2022 中附带）
-- 系统已安装 LLVM（本例为 LLVM 22.1.0，位于 `C:\Program Files\LLVM`）
+- Windows 10/11 x64
+- Rust stable（建议通过 `rustup` 安装）
+- Visual Studio 2022，并安装“使用 C++ 的桌面开发”工作负载
+- CMake
+- LLVM/libclang（`autocxx 0.26` 建议使用 LLVM 18；LLVM 22 的 AST 变化可能导致绑定生成失败）
 
-## 环境变量
-
-构建前必须设置 `SPOUT2_DIR` 指向 Spout2 SDK 源码目录：
-
-```powershell
-$env:SPOUT2_DIR = "$PWD\Spout2"
-```
-
-或直接使用相对路径：
-
-```powershell
-$env:SPOUT2_DIR = ".\Spout2"
-```
+项目已经包含 Spout2 SDK 源码和运行所需的 `SpoutLibrary.dll`。
 
 ## 构建
 
-在项目根目录执行：
+在项目根目录打开 PowerShell：
 
 ```powershell
-$env:SPOUT2_DIR = ".\Spout2"
-cargo build
+$env:SPOUT2_DIR = (Resolve-Path .\Spout2).Path
+$env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'
+cargo build --locked
 ```
 
-构建产物：`.\target\debug\spout-transparent.exe`
+Debug 产物位于 `target\debug\spout-transparent.exe`。Release 构建：
+
+```powershell
+$env:SPOUT2_DIR = (Resolve-Path .\Spout2).Path
+$env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'
+cargo build --release --locked
+```
+
+Release 产物位于 `target\release\spout-transparent.exe`。程序启动时会在可执行文件目录中确保存在 `SpoutLibrary.dll`。
 
 ## 运行
+
+先启动一个 Spout Sender，然后执行：
 
 ```powershell
 .\target\debug\spout-transparent.exe
 ```
 
-或直接双击可执行文件。
-
-> **注意**：运行前需确保同目录下存在 `SpoutLibrary.dll`（构建过程会自动拷贝至 `.\target\debug\`）。
-
-## Release 构建
+Debug 构建默认不会执行昂贵的 GPU 回读或写入诊断位图。需要采集 Sender 与 BackBuffer 时可显式开启：
 
 ```powershell
-cargo build --release
+$env:SPOUT_DEBUG_CAPTURE = '1'
+cargo run --locked
 ```
 
-产物位于 `.\target\release\spout-transparent.exe`
-
-## Clippy 检查
+## 质量检查
 
 ```powershell
-cargo clippy
+cargo fmt --all -- --check
+$env:SPOUT2_DIR = (Resolve-Path .\Spout2).Path
+$env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings
 ```
-
----
 
 ## 快捷键
 
 | 快捷键 | 功能 |
-|--------|------|
-| `Ctrl+Shift+M` | 切换交互模式（拖拽/缩放/穿透） |
-| `Ctrl+Shift+F` | 切换帧率档位（Unlimited → 120 → 60 → 30 → …） |
+| --- | --- |
+| `Ctrl+Shift+M` | 切换交互模式（拖拽、缩放或鼠标穿透） |
+| `Ctrl+Shift+F` | 切换帧率档位（Unlimited → 120 → 60 → 30） |
 | `Ctrl+Shift+T` | 切换窗口置顶 |
 | `Ctrl+Shift+Q` | 退出程序 |
 | `Esc` | 退出程序 |
 
-可通过项目根目录下的 `hotkeys.json` 自定义快捷键。
+可在工作目录或可执行文件目录放置 `hotkeys.json` 来覆盖默认全局快捷键。键值必须是单个 ASCII 字母或数字；支持的修饰键为 `CTRL`、`SHIFT` 和 `ALT`。全局快捷键已启用防重复触发。
 
----
+示例：
 
-## LLVM 22 兼容性补丁说明
-
-LLVM 22.1.0 的 `libclang` 与 `autocxx` 0.26 存在兼容性问题：`POINT (tagPOINT)` 在 AST 中被表示为匿名数组 `[u32; 2]` 而非命名结构体，导致 autoccxx 代码生成失败。
-
-已对注册表中的以下 crate 源码进行了补丁（无需修改系统 LLVM）：
-
-### 1. `autocxx-engine` 0.26.0 (`type_to_cpp.rs`)
-
-`Type::Array` 原行为直接报错 `UnsupportedType`，改为输出 `std::array<T,N>` C++ 类型。
-
-文件路径：
-```
-%USERPROFILE%\.cargo\registry\src\index.crates.io-*\autocxx-engine-0.26.0\src\conversion\codegen_cpp\type_to_cpp.rs
+```json
+{
+  "hotkeys": [
+    {
+      "modifiers": ["CTRL", "SHIFT"],
+      "key": "M",
+      "action": "toggle_interaction"
+    }
+  ]
+}
 ```
 
-### 2. `rust-spout2` 0.1.3 (`build.rs`)
+可用 action：`toggle_interaction`、`cycle_framerate`、`toggle_topmost`、`quit`。
 
-在 autocxx 代码生成后追加后处理步骤：
-- 为 `autocxxgen_ffi.h` 添加 `#include <windows.h>`（提供 `POINT` 定义）
-- 将 `SpoutMessageBoxPosition` 包装器的 `arg1` 参数加上 `reinterpret_cast<POINT*>` 强制转换
+## LLVM 22 兼容性
 
-文件路径：
-```
-%USERPROFILE%\.cargo\registry\src\index.crates.io-*\rust-spout2-0.1.3\build.rs
-```
-
-### 重新构建注意事项
-
-- 若清除 Cargo 缓存（`cargo clean` 或删除 `target\`），上述补丁仍然有效（修改的是 registry 源码）
-- 若更新了 `Cargo.lock` 或执行了 `cargo update`，需重新确认 `type_to_cpp.rs` 补丁
-- `build.rs` 原始备份位于同目录下的 `build.rs.bak`
+当前锁定的 `rust-spout2 0.1.3` / `autocxx 0.26.0` 在 LLVM 22 下可能把 Win32 `POINT` 解析成不兼容的匿名数组，从而导致代码生成失败。请优先切换到 LLVM 18，并将 `LIBCLANG_PATH` 指向对应的 `bin` 目录；不要直接修改 Cargo registry 中的 crate 源码，因为清理缓存或换机后这些修改会丢失。

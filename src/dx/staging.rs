@@ -6,6 +6,9 @@ pub fn create_staging_texture(
     width: u32,
     height: u32,
 ) -> windows::core::Result<ID3D11Texture2D> {
+    if width == 0 || height == 0 {
+        return Err(crate::dx::invalid_argument());
+    }
     let desc = D3D11_TEXTURE2D_DESC {
         Width: width,
         Height: height,
@@ -23,7 +26,7 @@ pub fn create_staging_texture(
     };
     let mut tex = None;
     unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex))? };
-    Ok(tex.unwrap())
+    tex.ok_or_else(crate::dx::missing_object)
 }
 
 pub fn read_alpha_from_staging(
@@ -40,7 +43,11 @@ pub fn read_alpha_from_staging(
     }
     let pitch = mapped.RowPitch;
     let ptr = mapped.pData as *const u8;
-    alpha.reserve((width * height) as usize);
+    let Some(pixel_count) = (width as usize).checked_mul(height as usize) else {
+        unsafe { context.Unmap(staging, 0) };
+        return;
+    };
+    alpha.reserve(pixel_count);
     for y in 0..height {
         let row_ptr = unsafe { ptr.add((y * pitch) as usize) };
         for x in 0..width {

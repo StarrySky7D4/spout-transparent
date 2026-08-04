@@ -7,6 +7,9 @@ pub fn create_swapchain(
     width: u32,
     height: u32,
 ) -> windows::core::Result<(IDXGISwapChain1, ID3D11RenderTargetView)> {
+    if width == 0 || height == 0 {
+        return Err(crate::dx::invalid_argument());
+    }
     let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory1()? };
     let desc = DXGI_SWAP_CHAIN_DESC1 {
         Width: width,
@@ -37,5 +40,5 @@ pub fn create_swapchain(
     unsafe {
         device.CreateRenderTargetView(&backbuffer, None, Some(&mut rtv))?;
     }
-    Ok((swapchain, rtv.unwrap()))
+    Ok((swapchain, rtv.ok_or_else(crate::dx::missing_object)?))
 }

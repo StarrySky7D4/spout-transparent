@@ -43,7 +43,8 @@ pub struct Pipeline {
 }
 
 fn compile_shader(code: &str, target: &str) -> windows::core::Result<Vec<u8>> {
-    let c_target = std::ffi::CString::new(target).map_err(|_| windows::core::Error::from_win32())?;
+    let c_target =
+        std::ffi::CString::new(target).map_err(|_| windows::core::Error::from_win32())?;
     let c_entry = std::ffi::CString::new("main").map_err(|_| windows::core::Error::from_win32())?;
     let mut blob = None;
     let mut error_blob = None;
@@ -81,9 +82,13 @@ pub fn create_pipeline(device: &ID3D11Device) -> windows::core::Result<Pipeline>
     let ps_blob = compile_shader(PS_SRC, "ps_5_0")?;
 
     let mut vs = None;
-    unsafe { device.CreateVertexShader(&vs_blob, None, Some(&mut vs))?; }
+    unsafe {
+        device.CreateVertexShader(&vs_blob, None, Some(&mut vs))?;
+    }
     let mut ps = None;
-    unsafe { device.CreatePixelShader(&ps_blob, None, Some(&mut ps))?; }
+    unsafe {
+        device.CreatePixelShader(&ps_blob, None, Some(&mut ps))?;
+    }
 
     let sampler_desc = D3D11_SAMPLER_DESC {
         Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
@@ -94,7 +99,9 @@ pub fn create_pipeline(device: &ID3D11Device) -> windows::core::Result<Pipeline>
         ..Default::default()
     };
     let mut sampler = None;
-    unsafe { device.CreateSamplerState(&sampler_desc, Some(&mut sampler))?; }
+    unsafe {
+        device.CreateSamplerState(&sampler_desc, Some(&mut sampler))?;
+    }
 
     let raster_desc = D3D11_RASTERIZER_DESC {
         FillMode: D3D11_FILL_SOLID,
@@ -109,12 +116,14 @@ pub fn create_pipeline(device: &ID3D11Device) -> windows::core::Result<Pipeline>
         AntialiasedLineEnable: false.into(),
     };
     let mut raster_state = None;
-    unsafe { device.CreateRasterizerState(&raster_desc, Some(&mut raster_state))?; }
+    unsafe {
+        device.CreateRasterizerState(&raster_desc, Some(&mut raster_state))?;
+    }
 
     Ok(Pipeline {
-        vs: vs.unwrap(),
-        ps: ps.unwrap(),
-        sampler: sampler.unwrap(),
-        raster_state: raster_state.unwrap(),
+        vs: vs.ok_or_else(crate::dx::missing_object)?,
+        ps: ps.ok_or_else(crate::dx::missing_object)?,
+        sampler: sampler.ok_or_else(crate::dx::missing_object)?,
+        raster_state: raster_state.ok_or_else(crate::dx::missing_object)?,
     })
 }
