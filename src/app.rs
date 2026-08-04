@@ -19,7 +19,6 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::Window;
 
 use crate::config::FramePacer;
-use crate::dx::composition::DCompResources;
 #[cfg(debug_assertions)]
 use crate::dx::constants;
 use crate::dx::device::create_dx11_device_auto;
@@ -89,7 +88,6 @@ struct SenderResources {
     srv: ID3D11ShaderResourceView,
     keyed_mutex: Option<IDXGIKeyedMutex>,
     named_mutex: Option<NamedMutex>,
-    handle: *mut std::ffi::c_void,
     width: u32,
     height: u32,
 }
@@ -149,7 +147,6 @@ impl SenderResources {
             srv,
             keyed_mutex,
             named_mutex,
-            handle,
             width: desc.Width,
             height: desc.Height,
         })
@@ -329,13 +326,37 @@ fn sample_pixel(
     }
 }
 
-fn init_spout() -> Result<SpoutReceiver, String> {
-    let mut spout = SpoutReceiver::new();
-    let sender_name = spout
-        .connect_first(Duration::from_secs(5))
-        .map_err(|error| format!("Spout connection: {error}"))?;
-    log::info!("Connected to '{sender_name}'");
-    Ok(spout)
+#[cfg(debug_assertions)]
+fn capture_sender_texture(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    sender: &SenderResources,
+) {
+    if !debug_capture_enabled() {
+        return;
+    }
+    let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+    else {
+        log::warn!("Could not locate the executable directory for sender capture");
+        return;
+    };
+    save_texture_to_bmp(
+        device,
+        context,
+        &sender.tex,
+        "SenderTexture",
+        &exe_dir.join("debug_01_sender_texture.bmp"),
+    );
+    sample_pixel(
+        device,
+        context,
+        &sender.tex,
+        sender.width / 2,
+        sender.height / 2,
+        "SenderCenter",
+    );
 }
 
 struct AppInit {
@@ -344,8 +365,6 @@ struct AppInit {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     spout: SpoutReceiver,
-    sender: SenderResources,
-    swapchain_res: SwapchainResources,
     pipeline: crate::dx::pipeline::Pipeline,
 }
 
@@ -355,56 +374,16 @@ fn init_app() -> Result<AppInit, String> {
     let (device, context) = create_dx11_device_auto().map_err(|e| format!("DX11 device: {e:?}"))?;
     log::info!("DX11 device OK");
 
-    let spout = init_spout()?;
-
-    let raw_handle = spout.sender_handle();
-    let sender_name = spout
-        .current_name()
-        .ok_or_else(|| "Spout receiver has no selected sender".to_string())?;
-    log::info!("Shared handle={raw_handle:?}");
-
-    let sender = SenderResources::open(&device, raw_handle, sender_name)?;
-
-    #[cfg(debug_assertions)]
-    {
-        if debug_capture_enabled() {
-            let exe_dir = std::env::current_exe()
-                .map_err(|e| format!("exe path: {e}"))?
-                .parent()
-                .ok_or("no parent")?
-                .to_path_buf();
-            save_texture_to_bmp(
-                &device,
-                &context,
-                &sender.tex,
-                "SenderTexture",
-                &exe_dir.join("debug_01_sender_texture.bmp"),
-            );
-            sample_pixel(
-                &device,
-                &context,
-                &sender.tex,
-                sender.width / 2,
-                sender.height / 2,
-                "SenderCenter",
-            );
-        }
-    }
+    let spout = SpoutReceiver::new();
 
     let pipeline = create_pipeline(&device).map_err(|e| format!("Pipeline: {e:?}"))?;
     log::info!("Pipeline OK");
-
-    let swapchain_res = SwapchainResources::new(&device, sender.width, sender.height)
-        .map_err(|e| format!("Swapchain: {e:?}"))?;
-    log::info!("Swapchain OK ({}x{})", sender.width, sender.height);
 
     Ok(AppInit {
         com_guard,
         device,
         context,
         spout,
-        sender,
-        swapchain_res,
         pipeline,
     })
 }
@@ -436,13 +415,6 @@ fn render_frame(
         context.IASetInputLayout(None);
         context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         context.Draw(3, 0);
-    }
-}
-
-fn clear_frame(context: &ID3D11DeviceContext, rtv: &ID3D11RenderTargetView) {
-    unsafe {
-        context.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
-        context.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 0.0]);
     }
 }
 
@@ -487,12 +459,11 @@ struct RenderState {
     base_width: u32,
     base_height: u32,
     current_handle: *mut std::ffi::c_void,
-    current_sender_name: SenderName,
+    current_sender_name: Option<SenderName>,
     current_sender_generation: u64,
     last_scale: f32,
     alpha_buf: Vec<u8>,
     pacer: FramePacer,
-    content_visible: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -500,13 +471,16 @@ enum FrameUpdate {
     #[default]
     Unchanged,
     Rendered,
-    Cleared,
 }
 
 impl FrameUpdate {
     fn needs_present(self) -> bool {
         self != Self::Unchanged
     }
+}
+
+fn window_should_be_visible(source_ready: bool, visibility_requested: bool) -> bool {
+    source_ready && visibility_requested
 }
 
 pub fn run() -> Result<(), String> {
@@ -521,10 +495,7 @@ pub fn run() -> Result<(), String> {
         .create_window(
             Window::default_attributes()
                 .with_title("Spout Receiver (Transparent)")
-                .with_inner_size(winit::dpi::LogicalSize::new(
-                    app_init.sender.width as f64,
-                    app_init.sender.height as f64,
-                ))
+                .with_inner_size(winit::dpi::LogicalSize::new(1.0, 1.0))
                 .with_transparent(true)
                 .with_decorations(false),
         )
@@ -574,23 +545,6 @@ pub fn run() -> Result<(), String> {
     let dcomp = crate::dx::composition::setup_dcomp(&dxgi_device, hwnd)
         .map_err(|e| format!("DComp setup: {e:?}"))?;
 
-    let _ = window.request_inner_size(PhysicalSize::new(
-        app_init.sender.width,
-        app_init.sender.height,
-    ));
-
-    unsafe {
-        let _ = dcomp
-            .root_visual
-            .SetContent(&app_init.swapchain_res.swapchain);
-        let _ = dcomp.device.Commit();
-    }
-
-    unsafe {
-        context_clear_present(&app_init.context, &app_init.swapchain_res, &dcomp);
-    }
-    log::info!("Initial frame presented");
-
     #[cfg(debug_assertions)]
     {
         let ex = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) };
@@ -608,14 +562,18 @@ pub fn run() -> Result<(), String> {
         .map_err(|e| format!("Mouse hook: {e}"))?;
     log::info!("InteractionState OK");
 
-    let mut window_visible = true;
+    let mut window_requested_visible = true;
+    let mut window_visible = false;
+    let mut source_available = false;
     tray_icon.update_state(TrayState {
         visible: window_visible,
         interaction: interaction_state.enabled,
         topmost: interaction_state.topmost,
         frame_rate: crate::config::FrameRate::Unlimited,
+        has_source: source_available,
     });
-    window.set_visible(true);
+    tray_icon.update_sources(Vec::new(), None);
+    log::info!("No Spout sender yet; waiting in the system tray");
     log::info!("=== Entering render loop ===");
 
     let context = app_init.context.clone();
@@ -623,35 +581,27 @@ pub fn run() -> Result<(), String> {
     let dcomp_device = dcomp.device.clone();
     let root_visual = dcomp.root_visual.clone();
 
-    let init_handle = app_init.sender.handle;
-    let init_sender_name = app_init
-        .spout
-        .current_name()
-        .cloned()
-        .ok_or_else(|| "Spout receiver lost its sender during initialization".to_string())?;
-    let init_sender_generation = app_init.spout.generation();
-    let init_w = app_init.sender.width;
-    let init_h = app_init.sender.height;
-
     let mut rs = RenderState {
         spout: app_init.spout,
-        sender: Some(app_init.sender),
-        swapchain_res: Some(app_init.swapchain_res),
+        sender: None,
+        swapchain_res: None,
         pipeline: app_init.pipeline,
         frame_count: 0,
-        last_fail_time: Instant::now(),
+        last_fail_time: Instant::now() - Duration::from_secs(1),
         #[cfg(debug_assertions)]
         first_render_logged: false,
-        base_width: init_w,
-        base_height: init_h,
-        current_handle: init_handle,
-        current_sender_name: init_sender_name,
-        current_sender_generation: init_sender_generation,
+        base_width: 1,
+        base_height: 1,
+        current_handle: std::ptr::null_mut(),
+        current_sender_name: None,
+        current_sender_generation: 0,
         last_scale: interaction_state.scale_factor,
         alpha_buf: Vec::new(),
         pacer: FramePacer::new(Instant::now()),
-        content_visible: false,
     };
+    let mut available_senders = Vec::new();
+    let mut menu_selected_source: Option<SenderName> = None;
+    let mut next_sender_refresh = Instant::now();
 
     #[allow(deprecated)]
     event_loop
@@ -712,10 +662,13 @@ pub fn run() -> Result<(), String> {
                     if let Some(action) = tray_icon.take_action() {
                         match action {
                             TrayAction::ToggleVisibility => {
-                                window_visible = !window_visible;
-                                window.set_visible(window_visible);
-                                if window_visible {
-                                    rs.pacer.request_frame();
+                                if source_available {
+                                    window_requested_visible = !window_visible;
+                                    window_visible = window_requested_visible;
+                                    window.set_visible(window_visible);
+                                    if window_visible {
+                                        rs.pacer.request_frame();
+                                    }
                                 }
                             }
                             TrayAction::ToggleInteraction => {
@@ -728,6 +681,13 @@ pub fn run() -> Result<(), String> {
                                 rs.pacer.set_rate(frame_rate);
                                 log::info!("Frame rate: {}", frame_rate.display_name());
                             }
+                            TrayAction::SelectSource(index) => {
+                                if let Some(sender_name) = available_senders.get(index).cloned() {
+                                    log::info!("Selecting Spout sender '{sender_name}'");
+                                    rs.spout.select(sender_name);
+                                    rs.pacer.request_frame();
+                                }
+                            }
                             TrayAction::Quit => {
                                 interaction_state.cleanup(hwnd);
                                 elwt.exit();
@@ -736,12 +696,26 @@ pub fn run() -> Result<(), String> {
                         }
                     }
 
-                    tray_icon.update_state(TrayState {
-                        visible: window_visible,
-                        interaction: interaction_state.enabled,
-                        topmost: interaction_state.topmost,
-                        frame_rate: rs.pacer.rate(),
-                    });
+                    let now = Instant::now();
+                    if now >= next_sender_refresh {
+                        match rs.spout.sender_names() {
+                            Ok(senders) => {
+                                available_senders = senders;
+                                tray_icon.update_sources(
+                                    available_senders
+                                        .iter()
+                                        .map(SenderName::display_name)
+                                        .collect(),
+                                    rs.spout.current_name().map(SenderName::display_name),
+                                );
+                                menu_selected_source = rs.spout.current_name().cloned();
+                            }
+                            Err(error) => {
+                                log::warn!("Failed to refresh Spout sender list: {error}");
+                            }
+                        }
+                        next_sender_refresh = now + Duration::from_millis(500);
+                    }
 
                     let recv = match rs.spout.poll() {
                         Ok(has_sender) => has_sender,
@@ -758,6 +732,17 @@ pub fn run() -> Result<(), String> {
                     let handle_ok = !new_handle.is_null();
                     let cooldown = rs.last_fail_time.elapsed() > Duration::from_millis(500);
 
+                    if new_sender_name != menu_selected_source {
+                        tray_icon.update_sources(
+                            available_senders
+                                .iter()
+                                .map(SenderName::display_name)
+                                .collect(),
+                            new_sender_name.as_ref().map(SenderName::display_name),
+                        );
+                        menu_selected_source = new_sender_name.clone();
+                    }
+
                     if rs.frame_count <= 3 || rs.frame_count.is_multiple_of(300) {
                         log::debug!(
                             "[Frame {}] recv={} handle_valid={} same={}",
@@ -765,9 +750,7 @@ pub fn run() -> Result<(), String> {
                         );
                     }
 
-                    let sender_changed = new_sender_name
-                        .as_ref()
-                        .is_some_and(|name| name != &rs.current_sender_name);
+                    let sender_changed = new_sender_name != rs.current_sender_name;
                     if handle_ok
                         && cooldown
                         && (new_handle != rs.current_handle
@@ -775,58 +758,73 @@ pub fn run() -> Result<(), String> {
                             || new_sender_generation != rs.current_sender_generation)
                     {
                         log::info!("[Frame {}] Sender resource changed, rebuilding...", rs.frame_count);
-                        let old_sender = rs.sender.take();
-                        if let Some(mut sr) = rs.swapchain_res.take() {
-                            let Some(sender_name) = new_sender_name.as_ref() else {
-                                rs.sender = old_sender;
+                        let Some(sender_name) = new_sender_name.as_ref() else {
+                            return;
+                        };
+                        let replacement = SenderResources::open(&device, new_handle, sender_name)
+                            .and_then(|sender| {
+                                SwapchainResources::new(&device, sender.width, sender.height)
+                                    .map(|swapchain| (sender, swapchain))
+                                    .map_err(|error| format!("Swapchain: {error:?}"))
+                            });
+                        match replacement {
+                            Ok((new_sender, sr)) => {
+                                #[cfg(debug_assertions)]
+                                capture_sender_texture(&device, &context, &new_sender);
+                                rs.base_width = new_sender.width;
+                                rs.base_height = new_sender.height;
+                                interaction_state.scale_factor = 1.0;
+                                rs.last_scale = 1.0;
+                                unsafe {
+                                    let _ = root_visual.SetContent(&sr.swapchain);
+                                    let _ = dcomp_device.Commit();
+                                }
+                                let _ = window
+                                    .request_inner_size(PhysicalSize::new(sr.width, sr.height));
                                 rs.swapchain_res = Some(sr);
-                                return;
-                            };
-                            match handle_sender_change(
-                                &device,
-                                new_handle,
-                                sender_name,
-                                &mut sr,
-                            ) {
-                                Ok(new_sender) => {
-                                    rs.base_width = new_sender.width;
-                                    rs.base_height = new_sender.height;
-                                    interaction_state.scale_factor = 1.0;
-                                    rs.last_scale = 1.0;
-                                    unsafe {
-                                        let _ = root_visual.SetContent(&sr.swapchain);
-                                        let _ = dcomp_device.Commit();
-                                    }
-                                    let _ = window.request_inner_size(
-                                        PhysicalSize::new(sr.width, sr.height),
-                                    );
-                                    rs.swapchain_res = Some(sr);
-                                    rs.sender = Some(new_sender);
-                                    rs.current_handle = new_handle;
-                                    rs.current_sender_name = sender_name.clone();
-                                    rs.current_sender_generation = new_sender_generation;
-                                    rs.pacer.request_frame();
-                                    drop(old_sender);
-                                    log::info!("[Frame {}] Texture rebuild complete", rs.frame_count);
-                                }
-                                Err(e) => {
-                                    log::error!("Rebuild failed: {e:?}");
-                                    rs.sender = old_sender;
-                                    rs.swapchain_res = Some(sr);
-                                    rs.last_fail_time = Instant::now();
-                                }
+                                rs.sender = Some(new_sender);
+                                rs.current_handle = new_handle;
+                                rs.current_sender_name = Some(sender_name.clone());
+                                rs.current_sender_generation = new_sender_generation;
+                                rs.pacer.request_frame();
+                                log::info!("[Frame {}] Texture rebuild complete", rs.frame_count);
+                            }
+                            Err(error) => {
+                                log::error!("Rebuild failed: {error}");
+                                rs.last_fail_time = Instant::now();
                             }
                         }
                     }
 
+                    let source_ready = handle_ok
+                        && rs.sender.is_some()
+                        && rs.swapchain_res.is_some()
+                        && rs.current_handle == new_handle
+                        && rs.current_sender_name == new_sender_name;
+                    if source_ready != source_available {
+                        source_available = source_ready;
+                        window_visible =
+                            window_should_be_visible(source_available, window_requested_visible);
+                        window.set_visible(window_visible);
+                        if window_visible {
+                            rs.pacer.request_frame();
+                            log::info!("Spout sender available; showing the window");
+                        } else {
+                            log::info!("No usable Spout sender; hiding the window");
+                        }
+                    }
+
+                    tray_icon.update_state(TrayState {
+                        visible: window_visible,
+                        interaction: interaction_state.enabled,
+                        topmost: interaction_state.topmost,
+                        frame_rate: rs.pacer.rate(),
+                        has_source: source_available,
+                    });
+
                     let mut frame_update = FrameUpdate::Unchanged;
 
-                    if !handle_ok && rs.content_visible {
-                        if let Some(sr) = rs.swapchain_res.as_ref() {
-                            clear_frame(&context, &sr.rtv);
-                            frame_update = FrameUpdate::Cleared;
-                        }
-                    } else if let (Some(sr), Some(sn)) =
+                    if let (Some(sr), Some(sn)) =
                         (rs.swapchain_res.as_mut(), rs.sender.as_ref())
                     {
                         let target_size =
@@ -846,7 +844,6 @@ pub fn run() -> Result<(), String> {
                                             let _ = dcomp_device.Commit();
                                         }
                                         let _ = window.request_inner_size(target_size);
-                                        rs.content_visible = false;
                                         rs.pacer.request_frame();
                                     }
                                     Err(error) => {
@@ -943,7 +940,6 @@ pub fn run() -> Result<(), String> {
                             return;
                         }
                         rs.pacer.presented(Instant::now());
-                        rs.content_visible = frame_update == FrameUpdate::Rendered;
                     }
 
                     if let Some(deadline) =
@@ -963,40 +959,20 @@ pub fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn handle_sender_change(
-    device: &ID3D11Device,
-    new_handle: *mut std::ffi::c_void,
-    sender_name: &SenderName,
-    swapchain_res: &mut SwapchainResources,
-) -> Result<SenderResources, String> {
-    let new_sender = SenderResources::open(device, new_handle, sender_name)?;
-    if new_sender.width != swapchain_res.width || new_sender.height != swapchain_res.height {
-        swapchain_res
-            .rebuild(device, new_sender.width, new_sender.height)
-            .map_err(|error| format!("Swapchain rebuild: {error:?}"))?;
-    }
-    Ok(new_sender)
-}
-
-unsafe fn context_clear_present(
-    context: &ID3D11DeviceContext,
-    sr: &SwapchainResources,
-    dcomp: &DCompResources,
-) {
-    context.OMSetRenderTargets(Some(&[Some(sr.rtv.clone())]), None);
-    context.ClearRenderTargetView(&sr.rtv, &[0.0, 0.0, 0.0, 0.0]);
-    let _ = sr.swapchain.Present(0, DXGI_PRESENT(0));
-    let _ = dcomp.device.Commit();
-}
-
 #[cfg(test)]
 mod tests {
-    use super::FrameUpdate;
+    use super::{window_should_be_visible, FrameUpdate};
 
     #[test]
     fn unchanged_backbuffer_is_not_presented() {
         assert!(!FrameUpdate::Unchanged.needs_present());
         assert!(FrameUpdate::Rendered.needs_present());
-        assert!(FrameUpdate::Cleared.needs_present());
+    }
+
+    #[test]
+    fn window_stays_hidden_without_a_sender() {
+        assert!(!window_should_be_visible(false, true));
+        assert!(window_should_be_visible(true, true));
+        assert!(!window_should_be_visible(true, false));
     }
 }

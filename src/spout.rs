@@ -19,7 +19,6 @@ const SENDER_NAME_CAPACITY: usize = 256;
 const MAX_SENDER_LIST_BYTES: usize = SENDER_NAME_CAPACITY * 4096;
 const SHARED_TEXTURE_INFO_SIZE: usize = 280;
 const METADATA_LOCK_TIMEOUT_MS: u32 = 67;
-const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct SenderName(Vec<u8>);
@@ -151,27 +150,6 @@ impl SpoutReceiver {
         self.selected = Some(sender);
         self.current = None;
         self.next_discovery = Instant::now();
-    }
-
-    pub fn connect_first(&mut self, timeout: Duration) -> io::Result<SenderName> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let names = self.sender_names()?;
-            if let Some(name) = names.into_iter().next() {
-                self.select(name.clone());
-                if self.poll()? {
-                    return Ok(name);
-                }
-            }
-
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "no usable Spout sender was found",
-                ));
-            }
-            std::thread::sleep(CONNECT_RETRY_INTERVAL);
-        }
     }
 
     pub fn poll(&mut self) -> io::Result<bool> {
