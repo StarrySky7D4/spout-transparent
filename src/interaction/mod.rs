@@ -393,6 +393,10 @@ impl InteractionState {
         window.set_outer_position(PhysicalPosition::new(new_x, new_y));
     }
 
+    pub fn is_dragging(&self) -> bool {
+        self.dragging
+    }
+
     pub fn should_update_alpha(&mut self) -> bool {
         self.frame_counter += 1;
         if self.frame_counter >= ALPHA_UPDATE_INTERVAL {

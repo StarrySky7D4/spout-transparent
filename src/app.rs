@@ -18,7 +18,7 @@ use winit::event_loop::ControlFlow;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::Window;
 
-use crate::config::FrameRate;
+use crate::config::FramePacer;
 use crate::dx::composition::DCompResources;
 #[cfg(debug_assertions)]
 use crate::dx::constants;
@@ -490,19 +490,21 @@ struct RenderState {
     current_sender_generation: u64,
     last_scale: f32,
     alpha_buf: Vec<u8>,
-    frame_rate: FrameRate,
-    last_render_time: Instant,
+    pacer: FramePacer,
+    content_visible: bool,
 }
 
-impl RenderState {
-    fn should_render(&self, has_new_frame: bool) -> bool {
-        if !has_new_frame {
-            return false;
-        }
-        match self.frame_rate.interval() {
-            None => true,
-            Some(interval) => self.last_render_time.elapsed() >= interval,
-        }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum FrameUpdate {
+    #[default]
+    Unchanged,
+    Rendered,
+    Cleared,
+}
+
+impl FrameUpdate {
+    fn needs_present(self) -> bool {
+        self != Self::Unchanged
     }
 }
 
@@ -638,8 +640,8 @@ pub fn run() -> Result<(), String> {
         current_sender_generation: init_sender_generation,
         last_scale: interaction_state.scale_factor,
         alpha_buf: Vec::new(),
-        frame_rate: FrameRate::Unlimited,
-        last_render_time: Instant::now(),
+        pacer: FramePacer::new(Instant::now()),
+        content_visible: false,
     };
 
     #[allow(deprecated)]
@@ -694,8 +696,8 @@ pub fn run() -> Result<(), String> {
                         interaction_state.toggle_topmost(hwnd);
                     }
                     if interaction::poll_cycle_framerate() {
-                        rs.frame_rate = rs.frame_rate.cycle();
-                        log::info!("Frame rate: {}", rs.frame_rate.display_name());
+                        let frame_rate = rs.pacer.cycle();
+                        log::info!("Frame rate: {}", frame_rate.display_name());
                     }
 
                     let recv = match rs.spout.poll() {
@@ -760,6 +762,7 @@ pub fn run() -> Result<(), String> {
                                     rs.current_handle = new_handle;
                                     rs.current_sender_name = sender_name.clone();
                                     rs.current_sender_generation = new_sender_generation;
+                                    rs.pacer.request_frame();
                                     drop(old_sender);
                                     log::info!("[Frame {}] Texture rebuild complete", rs.frame_count);
                                 }
@@ -773,9 +776,16 @@ pub fn run() -> Result<(), String> {
                         }
                     }
 
-                    let should_render = rs.should_render(recv);
+                    let mut frame_update = FrameUpdate::Unchanged;
 
-                    if let (Some(sr), Some(sn)) = (rs.swapchain_res.as_mut(), rs.sender.as_ref()) {
+                    if !handle_ok && rs.content_visible {
+                        if let Some(sr) = rs.swapchain_res.as_ref() {
+                            clear_frame(&context, &sr.rtv);
+                            frame_update = FrameUpdate::Cleared;
+                        }
+                    } else if let (Some(sr), Some(sn)) =
+                        (rs.swapchain_res.as_mut(), rs.sender.as_ref())
+                    {
                         let target_size =
                             interaction_state.scaled_size(rs.base_width, rs.base_height);
                         let target_w = target_size.width;
@@ -793,6 +803,8 @@ pub fn run() -> Result<(), String> {
                                             let _ = dcomp_device.Commit();
                                         }
                                         let _ = window.request_inner_size(target_size);
+                                        rs.content_visible = false;
+                                        rs.pacer.request_frame();
                                     }
                                     Err(error) => {
                                         interaction_state.scale_factor = rs.last_scale;
@@ -804,7 +816,7 @@ pub fn run() -> Result<(), String> {
                             }
                         }
 
-                        if should_render {
+                        if recv && rs.pacer.is_due(Instant::now()) {
                             let mutex_guard = sn
                                 .keyed_mutex
                                 .as_ref()
@@ -828,6 +840,7 @@ pub fn run() -> Result<(), String> {
                                     sr.width,
                                     sr.height,
                                 );
+                                frame_update = FrameUpdate::Rendered;
 
                                 #[cfg(debug_assertions)]
                                 if !rs.first_render_logged {
@@ -858,20 +871,27 @@ pub fn run() -> Result<(), String> {
                                     rs.first_render_logged = true;
                                 }
 
-                                rs.last_render_time = Instant::now();
+                                if !interaction_state.is_dragging()
+                                    && interaction_state.should_update_alpha()
+                                {
+                                    update_alpha(
+                                        &context,
+                                        sr,
+                                        &mut interaction_state,
+                                        &mut rs.alpha_buf,
+                                    );
+                                }
                             } else {
                                 log::trace!("Skipped frame: sender keyed mutex is busy");
                             }
                         }
-
-                        if interaction_state.should_update_alpha() {
-                            update_alpha(&context, sr, &mut interaction_state, &mut rs.alpha_buf);
-                        }
-                    } else if let Some(sr) = rs.swapchain_res.as_ref() {
-                        clear_frame(&context, &sr.rtv);
                     }
 
-                    if let Some(sr) = rs.swapchain_res.as_ref() {
+                    let presented_frame = frame_update.needs_present();
+                    if presented_frame {
+                        let Some(sr) = rs.swapchain_res.as_ref() else {
+                            return;
+                        };
                         let present_result = unsafe { sr.swapchain.Present(1, DXGI_PRESENT(0)) };
                         if present_result.is_err() {
                             log::error!("Swapchain Present failed: {present_result:?}");
@@ -879,19 +899,17 @@ pub fn run() -> Result<(), String> {
                             elwt.exit();
                             return;
                         }
+                        rs.pacer.presented(Instant::now());
+                        rs.content_visible = frame_update == FrameUpdate::Rendered;
                     }
 
-                    if !recv {
-                        let sleep_dur = match rs.frame_rate.interval() {
-                            Some(interval) => {
-                                let remaining = interval.saturating_sub(rs.last_render_time.elapsed());
-                                remaining.min(Duration::from_millis(2))
-                            }
-                            None => Duration::from_millis(1),
-                        };
-                        if !sleep_dur.is_zero() {
-                            std::thread::sleep(sleep_dur);
-                        }
+                    if let Some(deadline) =
+                        rs.pacer
+                            .next_wake(Instant::now(), handle_ok, presented_frame)
+                    {
+                        elwt.set_control_flow(ControlFlow::WaitUntil(deadline));
+                    } else {
+                        elwt.set_control_flow(ControlFlow::Poll);
                     }
                 }
                 _ => {}
@@ -926,4 +944,16 @@ unsafe fn context_clear_present(
     context.ClearRenderTargetView(&sr.rtv, &[0.0, 0.0, 0.0, 0.0]);
     let _ = sr.swapchain.Present(0, DXGI_PRESENT(0));
     let _ = dcomp.device.Commit();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FrameUpdate;
+
+    #[test]
+    fn unchanged_backbuffer_is_not_presented() {
+        assert!(!FrameUpdate::Unchanged.needs_present());
+        assert!(FrameUpdate::Rendered.needs_present());
+        assert!(FrameUpdate::Cleared.needs_present());
+    }
 }
