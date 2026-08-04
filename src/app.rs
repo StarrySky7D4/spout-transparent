@@ -29,6 +29,7 @@ use crate::dx::staging::{create_staging_texture, read_alpha_from_staging};
 use crate::dx::swapchain::create_swapchain;
 use crate::interaction;
 use crate::spout::{NamedMutex, SenderName, SpoutReceiver};
+use crate::tray::{TrayAction, TrayIcon, TrayState};
 
 struct ComGuard;
 impl ComGuard {
@@ -546,6 +547,7 @@ pub fn run() -> Result<(), String> {
     }
 
     interaction::InteractionState::init_window_style(hwnd);
+    let tray_icon = TrayIcon::install(hwnd).map_err(|e| format!("Tray icon: {e:?}"))?;
 
     let hotkey_path = if std::path::Path::new("hotkeys.json").exists() {
         PathBuf::from("hotkeys.json")
@@ -606,6 +608,13 @@ pub fn run() -> Result<(), String> {
         .map_err(|e| format!("Mouse hook: {e}"))?;
     log::info!("InteractionState OK");
 
+    let mut window_visible = true;
+    tray_icon.update_state(TrayState {
+        visible: window_visible,
+        interaction: interaction_state.enabled,
+        topmost: interaction_state.topmost,
+        frame_rate: crate::config::FrameRate::Unlimited,
+    });
     window.set_visible(true);
     log::info!("=== Entering render loop ===");
 
@@ -699,6 +708,40 @@ pub fn run() -> Result<(), String> {
                         let frame_rate = rs.pacer.cycle();
                         log::info!("Frame rate: {}", frame_rate.display_name());
                     }
+
+                    if let Some(action) = tray_icon.take_action() {
+                        match action {
+                            TrayAction::ToggleVisibility => {
+                                window_visible = !window_visible;
+                                window.set_visible(window_visible);
+                                if window_visible {
+                                    rs.pacer.request_frame();
+                                }
+                            }
+                            TrayAction::ToggleInteraction => {
+                                interaction_state.toggle_enabled(hwnd);
+                            }
+                            TrayAction::ToggleTopmost => {
+                                interaction_state.toggle_topmost(hwnd);
+                            }
+                            TrayAction::SetFrameRate(frame_rate) => {
+                                rs.pacer.set_rate(frame_rate);
+                                log::info!("Frame rate: {}", frame_rate.display_name());
+                            }
+                            TrayAction::Quit => {
+                                interaction_state.cleanup(hwnd);
+                                elwt.exit();
+                                return;
+                            }
+                        }
+                    }
+
+                    tray_icon.update_state(TrayState {
+                        visible: window_visible,
+                        interaction: interaction_state.enabled,
+                        topmost: interaction_state.topmost,
+                        frame_rate: rs.pacer.rate(),
+                    });
 
                     let recv = match rs.spout.poll() {
                         Ok(has_sender) => has_sender,
@@ -816,7 +859,7 @@ pub fn run() -> Result<(), String> {
                             }
                         }
 
-                        if recv && rs.pacer.is_due(Instant::now()) {
+                        if window_visible && recv && rs.pacer.is_due(Instant::now()) {
                             let mutex_guard = sn
                                 .keyed_mutex
                                 .as_ref()
@@ -905,7 +948,7 @@ pub fn run() -> Result<(), String> {
 
                     if let Some(deadline) =
                         rs.pacer
-                            .next_wake(Instant::now(), handle_ok, presented_frame)
+                            .next_wake(Instant::now(), handle_ok && window_visible, presented_frame)
                     {
                         elwt.set_control_flow(ControlFlow::WaitUntil(deadline));
                     } else {

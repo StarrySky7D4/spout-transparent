@@ -5,6 +5,7 @@ mod config;
 mod dx;
 mod interaction;
 mod spout;
+mod tray;
 
 #[cfg(debug_assertions)]
 fn attach_console() {

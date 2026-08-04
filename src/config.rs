@@ -45,7 +45,7 @@ pub struct FramePacer {
 
 impl FramePacer {
     const BUSY_RETRY: Duration = Duration::from_millis(1);
-    const DISCONNECTED_RETRY: Duration = Duration::from_millis(16);
+    const INACTIVE_RETRY: Duration = Duration::from_millis(100);
 
     pub fn new(now: Instant) -> Self {
         Self {
@@ -56,8 +56,18 @@ impl FramePacer {
     }
 
     pub fn cycle(&mut self) -> FrameRate {
-        self.rate = self.rate.cycle();
-        self.force_next = true;
+        self.set_rate(self.rate.cycle());
+        self.rate
+    }
+
+    pub fn set_rate(&mut self, rate: FrameRate) {
+        if self.rate != rate {
+            self.rate = rate;
+            self.force_next = true;
+        }
+    }
+
+    pub fn rate(&self) -> FrameRate {
         self.rate
     }
 
@@ -78,14 +88,9 @@ impl FramePacer {
         self.force_next = false;
     }
 
-    pub fn next_wake(
-        &self,
-        now: Instant,
-        sender_connected: bool,
-        presented_frame: bool,
-    ) -> Option<Instant> {
-        if !sender_connected {
-            return Some(now + Self::DISCONNECTED_RETRY);
+    pub fn next_wake(&self, now: Instant, active: bool, presented_frame: bool) -> Option<Instant> {
+        if !active {
+            return Some(now + Self::INACTIVE_RETRY);
         }
         if !presented_frame && self.is_due(now) {
             return Some(now + Self::BUSY_RETRY);
@@ -137,5 +142,16 @@ mod tests {
             pacer.next_wake(start, true, true),
             Some(start + FrameRate::Fps120.interval().unwrap())
         );
+    }
+
+    #[test]
+    fn explicit_rate_selection_updates_the_pacer() {
+        let start = Instant::now();
+        let mut pacer = FramePacer::new(start);
+        pacer.presented(start);
+        pacer.set_rate(FrameRate::Fps30);
+
+        assert_eq!(pacer.rate(), FrameRate::Fps30);
+        assert!(pacer.is_due(start));
     }
 }
