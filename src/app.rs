@@ -1,9 +1,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use autocxx::c_uint;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use rust_spout2::Spout;
 use windows::core::Interface;
 use windows::Win32::Foundation::{HANDLE, HWND};
 use windows::Win32::Graphics::Direct3D::D3D10_1_SRV_DIMENSION_TEXTURE2D;
@@ -29,7 +27,7 @@ use crate::dx::pipeline::create_pipeline;
 use crate::dx::staging::{create_staging_texture, read_alpha_from_staging};
 use crate::dx::swapchain::create_swapchain;
 use crate::interaction;
-use crate::spout_util;
+use crate::spout::{NamedMutex, SenderName, SpoutReceiver};
 
 struct ComGuard;
 impl ComGuard {
@@ -42,16 +40,6 @@ impl ComGuard {
 impl Drop for ComGuard {
     fn drop(&mut self) {
         unsafe { CoUninitialize() };
-    }
-}
-
-struct SpoutGuard(Spout);
-impl SpoutGuard {
-    fn new(spout: Spout) -> Self {
-        Self(spout)
-    }
-    fn inner(&mut self) -> &mut Spout {
-        &mut self.0
     }
 }
 
@@ -97,16 +85,22 @@ struct SenderResources {
     tex: ID3D11Texture2D,
     srv: ID3D11ShaderResourceView,
     keyed_mutex: Option<IDXGIKeyedMutex>,
-    handle: *mut autocxx::c_void,
+    named_mutex: Option<NamedMutex>,
+    handle: *mut std::ffi::c_void,
     width: u32,
     height: u32,
 }
 
 impl SenderResources {
-    fn open(device: &ID3D11Device, handle: *mut autocxx::c_void) -> windows::core::Result<Self> {
+    fn open(
+        device: &ID3D11Device,
+        handle: *mut std::ffi::c_void,
+        sender_name: &SenderName,
+    ) -> Result<Self, String> {
         let mut tex: Option<ID3D11Texture2D> = None;
-        unsafe { device.OpenSharedResource(HANDLE(handle as *mut _), &mut tex)? };
-        let tex = tex.ok_or_else(crate::dx::missing_object)?;
+        unsafe { device.OpenSharedResource(HANDLE(handle), &mut tex) }
+            .map_err(|error| format!("OpenSharedResource: {error:?}"))?;
+        let tex = tex.ok_or_else(|| "OpenSharedResource returned no texture".to_string())?;
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { tex.GetDesc(&mut desc) };
         log::info!(
@@ -118,15 +112,26 @@ impl SenderResources {
             desc.BindFlags,
             desc.MiscFlags
         );
-        let mut srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC::default();
-        srv_desc.Format = desc.Format;
-        srv_desc.ViewDimension = D3D10_1_SRV_DIMENSION_TEXTURE2D;
+        let mut srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+            Format: desc.Format,
+            ViewDimension: D3D10_1_SRV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
         srv_desc.Anonymous.Texture2D.MostDetailedMip = 0;
         srv_desc.Anonymous.Texture2D.MipLevels = 1;
         let mut srv = None;
-        unsafe { device.CreateShaderResourceView(&tex, Some(&srv_desc), Some(&mut srv))? }
-        let srv = srv.ok_or_else(crate::dx::missing_object)?;
+        unsafe { device.CreateShaderResourceView(&tex, Some(&srv_desc), Some(&mut srv)) }
+            .map_err(|error| format!("CreateShaderResourceView: {error:?}"))?;
+        let srv = srv.ok_or_else(|| "CreateShaderResourceView returned no view".to_string())?;
         let keyed_mutex = tex.cast::<IDXGIKeyedMutex>().ok();
+        let named_mutex = if keyed_mutex.is_none() {
+            Some(
+                NamedMutex::for_sender_texture(sender_name)
+                    .map_err(|error| format!("Spout access mutex: {error}"))?,
+            )
+        } else {
+            None
+        };
         log::info!(
             "KeyedMutex: {}",
             if keyed_mutex.is_some() {
@@ -139,6 +144,7 @@ impl SenderResources {
             tex,
             srv,
             keyed_mutex,
+            named_mutex,
             handle,
             width: desc.Width,
             height: desc.Height,
@@ -319,26 +325,11 @@ fn sample_pixel(
     }
 }
 
-fn init_spout(device: &ID3D11Device) -> Result<SpoutGuard, String> {
-    let spout = Spout::new().ok_or("Spout2 init failed")?;
-    let mut spout = SpoutGuard::new(spout);
-    log::info!("Spout2 initialized");
-    let raw_dev = device.as_raw() as *mut autocxx::c_void;
-    if !unsafe { spout.inner().as_pin_mut().OpenDirectX11(raw_dev) } {
-        return Err("OpenDirectX11 failed".into());
-    }
-    log::info!("OpenDirectX11 OK");
-    let senders = spout_util::list_senders(spout.inner());
-    log::info!("Senders: {senders:?}");
-    if senders.is_empty() {
-        return Err("No Spout2 senders found. Please start a sender first.".into());
-    }
-    let sender_name = senders[0].clone();
-    if !spout_util::spout_connect(spout.inner(), &sender_name)
-        .map_err(|e| format!("Connection error: {e}"))?
-    {
-        return Err(format!("Connection to '{sender_name}' timed out"));
-    }
+fn init_spout() -> Result<SpoutReceiver, String> {
+    let mut spout = SpoutReceiver::new();
+    let sender_name = spout
+        .connect_first(Duration::from_secs(5))
+        .map_err(|error| format!("Spout connection: {error}"))?;
     log::info!("Connected to '{sender_name}'");
     Ok(spout)
 }
@@ -348,7 +339,7 @@ struct AppInit {
     com_guard: ComGuard,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
-    spout: SpoutGuard,
+    spout: SpoutReceiver,
     sender: SenderResources,
     swapchain_res: SwapchainResources,
     pipeline: crate::dx::pipeline::Pipeline,
@@ -360,16 +351,15 @@ fn init_app() -> Result<AppInit, String> {
     let (device, context) = create_dx11_device_auto().map_err(|e| format!("DX11 device: {e:?}"))?;
     log::info!("DX11 device OK");
 
-    let mut spout = init_spout(&device)?;
+    let spout = init_spout()?;
 
-    let raw_handle = spout.inner().as_pin_mut().GetSenderHandle();
-    if raw_handle.is_null() || raw_handle == (-1isize as *mut autocxx::c_void) {
-        return Err("GetSenderHandle returned null/invalid".into());
-    }
+    let raw_handle = spout.sender_handle();
+    let sender_name = spout
+        .current_name()
+        .ok_or_else(|| "Spout receiver has no selected sender".to_string())?;
     log::info!("Shared handle={raw_handle:?}");
 
-    let sender = SenderResources::open(&device, raw_handle)
-        .map_err(|e| format!("OpenSharedResource: {e:?}"))?;
+    let sender = SenderResources::open(&device, raw_handle, sender_name)?;
 
     #[cfg(debug_assertions)]
     {
@@ -482,7 +472,7 @@ fn update_alpha(
 }
 
 struct RenderState {
-    spout: SpoutGuard,
+    spout: SpoutReceiver,
     sender: Option<SenderResources>,
     swapchain_res: Option<SwapchainResources>,
     pipeline: crate::dx::pipeline::Pipeline,
@@ -491,7 +481,9 @@ struct RenderState {
     first_render_logged: bool,
     base_width: u32,
     base_height: u32,
-    current_handle: *mut autocxx::c_void,
+    current_handle: *mut std::ffi::c_void,
+    current_sender_name: SenderName,
+    current_sender_generation: u64,
     last_scale: f32,
     alpha_buf: Vec<u8>,
     frame_rate: FrameRate,
@@ -512,8 +504,6 @@ impl RenderState {
 
 pub fn run() -> Result<(), String> {
     log::info!("=== Spout Transparent ===");
-    spout_util::extract_spout_dll().map_err(|e| format!("DLL extract: {e}"))?;
-
     let app_init = init_app()?;
 
     #[allow(deprecated)]
@@ -619,6 +609,12 @@ pub fn run() -> Result<(), String> {
     let root_visual = dcomp.root_visual.clone();
 
     let init_handle = app_init.sender.handle;
+    let init_sender_name = app_init
+        .spout
+        .current_name()
+        .cloned()
+        .ok_or_else(|| "Spout receiver lost its sender during initialization".to_string())?;
+    let init_sender_generation = app_init.spout.generation();
     let init_w = app_init.sender.width;
     let init_h = app_init.sender.height;
 
@@ -633,6 +629,8 @@ pub fn run() -> Result<(), String> {
         base_width: init_w,
         base_height: init_h,
         current_handle: init_handle,
+        current_sender_name: init_sender_name,
+        current_sender_generation: init_sender_generation,
         last_scale: interaction_state.scale_factor,
         alpha_buf: Vec::new(),
         frame_rate: FrameRate::Unlimited,
@@ -695,17 +693,19 @@ pub fn run() -> Result<(), String> {
                         log::info!("Frame rate: {}", rs.frame_rate.display_name());
                     }
 
-                    let recv = rs.spout.inner().as_pin_mut().ReceiveTexture(
-                        c_uint(0),
-                        c_uint(0),
-                        true,
-                        c_uint(0),
-                    );
+                    let recv = match rs.spout.poll() {
+                        Ok(has_sender) => has_sender,
+                        Err(error) => {
+                            log::warn!("Spout metadata poll failed: {error}");
+                            false
+                        }
+                    };
                     rs.frame_count += 1;
 
-                    let new_handle = rs.spout.inner().as_pin_mut().GetSenderHandle();
-                    let handle_ok = !new_handle.is_null()
-                        && new_handle != (-1isize as *mut autocxx::c_void);
+                    let new_handle = rs.spout.sender_handle();
+                    let new_sender_name = rs.spout.current_name().cloned();
+                    let new_sender_generation = rs.spout.generation();
+                    let handle_ok = !new_handle.is_null();
                     let cooldown = rs.last_fail_time.elapsed() > Duration::from_millis(500);
 
                     if rs.frame_count <= 3 || rs.frame_count.is_multiple_of(300) {
@@ -715,13 +715,27 @@ pub fn run() -> Result<(), String> {
                         );
                     }
 
-                    if handle_ok && cooldown && new_handle != rs.current_handle {
-                        log::info!("[Frame {}] Handle changed, rebuilding...", rs.frame_count);
+                    let sender_changed = new_sender_name
+                        .as_ref()
+                        .is_some_and(|name| name != &rs.current_sender_name);
+                    if handle_ok
+                        && cooldown
+                        && (new_handle != rs.current_handle
+                            || sender_changed
+                            || new_sender_generation != rs.current_sender_generation)
+                    {
+                        log::info!("[Frame {}] Sender resource changed, rebuilding...", rs.frame_count);
                         let old_sender = rs.sender.take();
                         if let Some(mut sr) = rs.swapchain_res.take() {
+                            let Some(sender_name) = new_sender_name.as_ref() else {
+                                rs.sender = old_sender;
+                                rs.swapchain_res = Some(sr);
+                                return;
+                            };
                             match handle_sender_change(
                                 &device,
                                 new_handle,
+                                sender_name,
                                 &mut sr,
                             ) {
                                 Ok(new_sender) => {
@@ -739,6 +753,8 @@ pub fn run() -> Result<(), String> {
                                     rs.swapchain_res = Some(sr);
                                     rs.sender = Some(new_sender);
                                     rs.current_handle = new_handle;
+                                    rs.current_sender_name = sender_name.clone();
+                                    rs.current_sender_generation = new_sender_generation;
                                     drop(old_sender);
                                     log::info!("[Frame {}] Texture rebuild complete", rs.frame_count);
                                 }
@@ -788,8 +804,15 @@ pub fn run() -> Result<(), String> {
                                 .keyed_mutex
                                 .as_ref()
                                 .and_then(KeyedMutexGuard::try_acquire);
-                            let owns_sender_texture =
-                                sn.keyed_mutex.is_none() || mutex_guard.is_some();
+                            let named_mutex_guard = if sn.keyed_mutex.is_none() {
+                                sn.named_mutex
+                                    .as_ref()
+                                    .and_then(|mutex| mutex.try_lock().ok().flatten())
+                            } else {
+                                None
+                            };
+                            let owns_sender_texture = mutex_guard.is_some()
+                                || (sn.keyed_mutex.is_none() && named_mutex_guard.is_some());
 
                             if owns_sender_texture {
                                 render_frame(
@@ -844,8 +867,9 @@ pub fn run() -> Result<(), String> {
                     }
 
                     if let Some(sr) = rs.swapchain_res.as_ref() {
-                        if let Err(error) = unsafe { sr.swapchain.Present(1, DXGI_PRESENT(0)) } {
-                            log::error!("Swapchain Present failed: {error:?}");
+                        let present_result = unsafe { sr.swapchain.Present(1, DXGI_PRESENT(0)) };
+                        if present_result.is_err() {
+                            log::error!("Swapchain Present failed: {present_result:?}");
                             interaction_state.cleanup(hwnd);
                             elwt.exit();
                             return;
@@ -875,12 +899,15 @@ pub fn run() -> Result<(), String> {
 
 fn handle_sender_change(
     device: &ID3D11Device,
-    new_handle: *mut autocxx::c_void,
+    new_handle: *mut std::ffi::c_void,
+    sender_name: &SenderName,
     swapchain_res: &mut SwapchainResources,
-) -> windows::core::Result<SenderResources> {
-    let new_sender = SenderResources::open(device, new_handle)?;
+) -> Result<SenderResources, String> {
+    let new_sender = SenderResources::open(device, new_handle, sender_name)?;
     if new_sender.width != swapchain_res.width || new_sender.height != swapchain_res.height {
-        swapchain_res.rebuild(device, new_sender.width, new_sender.height)?;
+        swapchain_res
+            .rebuild(device, new_sender.width, new_sender.height)
+            .map_err(|error| format!("Swapchain rebuild: {error:?}"))?;
     }
     Ok(new_sender)
 }

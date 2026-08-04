@@ -4,7 +4,7 @@ mod app;
 mod config;
 mod dx;
 mod interaction;
-mod spout_util;
+mod spout;
 
 #[cfg(debug_assertions)]
 fn attach_console() {

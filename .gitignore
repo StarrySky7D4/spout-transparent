@@ -2,7 +2,6 @@
 *.pdb
 *.exe
 *.dll
-!SpoutLibrary.dll
 *.exp
 *.lib
 *.obj

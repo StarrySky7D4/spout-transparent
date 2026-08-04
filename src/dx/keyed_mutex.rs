@@ -22,7 +22,7 @@ impl<'a> KeyedMutexGuard<'a> {
 impl Drop for KeyedMutexGuard<'_> {
     fn drop(&mut self) {
         if self.acquired {
-            let _ = unsafe { self.mutex.ReleaseSync(1) };
+            let _ = unsafe { self.mutex.ReleaseSync(0) };
         }
     }
 }
