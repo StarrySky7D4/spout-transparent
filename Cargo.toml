@@ -2,6 +2,9 @@
 name = "spout-transparent"
 version = "0.1.0"
 edition = "2021"
+description = "Transparent Windows desktop receiver for Spout DX11 shared textures"
+repository = "https://github.com/StarrySky7D4/spout-transparent"
+readme = "README.md"
 
 [dependencies]
 windows = { version = "0.58", features = [
