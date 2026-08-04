@@ -9,8 +9,11 @@ pub const DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: i32 = 91;
 
 pub const BPP_RGBA: usize = 4;
 
+#[cfg(debug_assertions)]
 pub const EXSTYLE_LAYERED: i32 = 0x00080000;
+#[cfg(debug_assertions)]
 pub const EXSTYLE_TRANSPARENT: i32 = 0x00000020;
+#[cfg(debug_assertions)]
 pub const EXSTYLE_NOREDIRECTIONBITMAP: i32 = 0x00200000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -20,6 +20,7 @@ use winit::window::Window;
 
 use crate::config::FrameRate;
 use crate::dx::composition::DCompResources;
+#[cfg(debug_assertions)]
 use crate::dx::constants;
 use crate::dx::device::create_dx11_device_auto;
 use crate::dx::keyed_mutex::KeyedMutexGuard;
@@ -82,6 +83,7 @@ impl SwapchainResources {
 }
 
 struct SenderResources {
+    #[cfg(debug_assertions)]
     tex: ID3D11Texture2D,
     srv: ID3D11ShaderResourceView,
     keyed_mutex: Option<IDXGIKeyedMutex>,
@@ -141,6 +143,7 @@ impl SenderResources {
             }
         );
         Ok(Self {
+            #[cfg(debug_assertions)]
             tex,
             srv,
             keyed_mutex,
@@ -478,6 +481,7 @@ struct RenderState {
     pipeline: crate::dx::pipeline::Pipeline,
     frame_count: u64,
     last_fail_time: Instant,
+    #[cfg(debug_assertions)]
     first_render_logged: bool,
     base_width: u32,
     base_height: u32,
@@ -625,6 +629,7 @@ pub fn run() -> Result<(), String> {
         pipeline: app_init.pipeline,
         frame_count: 0,
         last_fail_time: Instant::now(),
+        #[cfg(debug_assertions)]
         first_render_logged: false,
         base_width: init_w,
         base_height: init_h,
