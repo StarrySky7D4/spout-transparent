@@ -5,6 +5,7 @@ use serde::Deserialize;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, MOD_SHIFT};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
@@ -28,7 +29,7 @@ const MAX_SCALE: f32 = 5.0;
 const SCALE_STEP: f32 = 0.05;
 const MAX_RENDER_DIMENSION: u32 = 16_384;
 const MOD_NOREPEAT_FLAG: u32 = 0x4000;
-pub const ALPHA_UPDATE_INTERVAL: u32 = 15;
+pub const ALPHA_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 pub const ALPHA_THRESHOLD: u8 = 10;
 const WM_HOTKEY_MSG: u32 = 0x0312;
 
@@ -248,7 +249,7 @@ pub struct InteractionState {
     drag_start_screen: (i32, i32),
     drag_start_origin: (i32, i32),
     modifiers: ModifiersState,
-    frame_counter: u32,
+    next_alpha_update: Instant,
     mouse_hook: Option<MouseHook>,
 }
 
@@ -262,7 +263,7 @@ impl InteractionState {
             drag_start_screen: (0, 0),
             drag_start_origin: (0, 0),
             modifiers: ModifiersState::default(),
-            frame_counter: 0,
+            next_alpha_update: Instant::now(),
             mouse_hook: None,
         }
     }
@@ -317,6 +318,9 @@ impl InteractionState {
 
     pub fn toggle_enabled(&mut self, hwnd: HWND) {
         self.enabled = !self.enabled;
+        if self.enabled {
+            self.next_alpha_update = Instant::now();
+        }
         if let Some(hook) = &self.mouse_hook {
             hook.set_enabled(self.enabled);
         }
@@ -397,13 +401,12 @@ impl InteractionState {
         self.dragging
     }
 
-    pub fn should_update_alpha(&mut self) -> bool {
-        self.frame_counter += 1;
-        if self.frame_counter >= ALPHA_UPDATE_INTERVAL {
-            self.frame_counter = 0;
-            return self.enabled;
+    pub fn should_update_alpha(&mut self, now: Instant) -> bool {
+        if !self.enabled || now < self.next_alpha_update {
+            return false;
         }
-        false
+        self.next_alpha_update = now + ALPHA_UPDATE_INTERVAL;
+        true
     }
 
     pub fn update_alpha_mask(&mut self, alpha: Vec<u8>, width: u32, height: u32) {
@@ -469,5 +472,17 @@ mod tests {
             state.scaled_size(u32::MAX, u32::MAX),
             winit::dpi::PhysicalSize::new(MAX_RENDER_DIMENSION, MAX_RENDER_DIMENSION)
         );
+    }
+
+    #[test]
+    fn alpha_updates_are_time_based() {
+        let mut state = InteractionState::new();
+        let start = Instant::now();
+        state.enabled = true;
+        state.next_alpha_update = start;
+
+        assert!(state.should_update_alpha(start));
+        assert!(!state.should_update_alpha(start + ALPHA_UPDATE_INTERVAL / 2));
+        assert!(state.should_update_alpha(start + ALPHA_UPDATE_INTERVAL));
     }
 }
