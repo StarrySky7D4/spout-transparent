@@ -24,7 +24,7 @@ use crate::dx::constants;
 use crate::dx::device::create_dx11_device_auto;
 use crate::dx::keyed_mutex::KeyedMutexGuard;
 use crate::dx::pipeline::create_pipeline;
-use crate::dx::staging::{create_staging_texture, read_alpha_from_staging};
+use crate::dx::staging::AlphaReadback;
 use crate::dx::swapchain::create_swapchain;
 use crate::interaction;
 use crate::spout::{NamedMutex, SenderName, SpoutReceiver};
@@ -44,10 +44,12 @@ impl Drop for ComGuard {
     }
 }
 
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(75);
+
 struct SwapchainResources {
     swapchain: IDXGISwapChain1,
     rtv: ID3D11RenderTargetView,
-    staging: ID3D11Texture2D,
+    alpha_readback: AlphaReadback,
     width: u32,
     height: u32,
 }
@@ -55,11 +57,11 @@ struct SwapchainResources {
 impl SwapchainResources {
     fn new(device: &ID3D11Device, width: u32, height: u32) -> windows::core::Result<Self> {
         let (swapchain, rtv) = create_swapchain(device, width, height)?;
-        let staging = create_staging_texture(device, width, height)?;
+        let alpha_readback = AlphaReadback::new(device, width, height)?;
         Ok(Self {
             swapchain,
             rtv,
-            staging,
+            alpha_readback,
             width,
             height,
         })
@@ -72,10 +74,10 @@ impl SwapchainResources {
         height: u32,
     ) -> windows::core::Result<()> {
         let (swapchain, rtv) = create_swapchain(device, width, height)?;
-        let staging = create_staging_texture(device, width, height)?;
+        let alpha_readback = AlphaReadback::new(device, width, height)?;
         self.swapchain = swapchain;
         self.rtv = rtv;
-        self.staging = staging;
+        self.alpha_readback = alpha_readback;
         self.width = width;
         self.height = height;
         Ok(())
@@ -420,30 +422,37 @@ fn render_frame(
 
 fn update_alpha(
     context: &ID3D11DeviceContext,
-    swapchain_res: &SwapchainResources,
+    swapchain_res: &mut SwapchainResources,
     interaction_state: &mut interaction::InteractionState,
     alpha_buf: &mut Vec<u8>,
+    schedule_copy: bool,
 ) {
-    if let Ok(bb) = unsafe { swapchain_res.swapchain.GetBuffer::<ID3D11Texture2D>(0) } {
-        let dst = swapchain_res.staging.cast::<ID3D11Resource>().ok();
-        let src = bb.cast::<ID3D11Resource>().ok();
-        if let (Some(d), Some(s)) = (dst, src) {
-            unsafe {
-                context.CopyResource(&d, &s);
-            }
-            read_alpha_from_staging(
-                context,
-                &swapchain_res.staging,
+    match swapchain_res.alpha_readback.try_read(context, alpha_buf) {
+        Ok(true) => {
+            interaction_state.update_alpha_mask(
+                std::mem::take(alpha_buf),
                 swapchain_res.width,
                 swapchain_res.height,
-                alpha_buf,
             );
-            if !alpha_buf.is_empty() {
-                let w = swapchain_res.width;
-                let h = swapchain_res.height;
-                interaction_state.update_alpha_mask(std::mem::take(alpha_buf), w, h);
+        }
+        Ok(false) => {}
+        Err(error) => log::warn!("Alpha readback failed: {error:?}"),
+    }
+
+    if !schedule_copy {
+        return;
+    }
+
+    match unsafe { swapchain_res.swapchain.GetBuffer::<ID3D11Texture2D>(0) } {
+        Ok(backbuffer) => {
+            if let Err(error) = swapchain_res
+                .alpha_readback
+                .enqueue_copy(context, &backbuffer)
+            {
+                log::warn!("Alpha readback copy failed: {error:?}");
             }
         }
+        Err(error) => log::warn!("Failed to get backbuffer for alpha readback: {error:?}"),
     }
 }
 
@@ -602,6 +611,7 @@ pub fn run() -> Result<(), String> {
     let mut available_senders = Vec::new();
     let mut menu_selected_source: Option<SenderName> = None;
     let mut next_sender_refresh = Instant::now();
+    let mut resize_deadline: Option<Instant> = None;
 
     #[allow(deprecated)]
     event_loop
@@ -628,7 +638,13 @@ pub fn run() -> Result<(), String> {
                         interaction_state.handle_keyboard(ke, hwnd);
                     }
                     WindowEvent::MouseWheel { delta, .. } => {
+                        let previous_scale = interaction_state.scale_factor;
                         interaction_state.handle_scroll(delta);
+                        if (previous_scale - interaction_state.scale_factor).abs()
+                            > f32::EPSILON
+                        {
+                            resize_deadline = Some(Instant::now() + RESIZE_DEBOUNCE);
+                        }
                     }
                     WindowEvent::MouseInput { state, button, .. } => {
                         interaction_state.handle_mouse_input(state, button, &window);
@@ -775,6 +791,7 @@ pub fn run() -> Result<(), String> {
                                 rs.base_height = new_sender.height;
                                 interaction_state.scale_factor = 1.0;
                                 rs.last_scale = 1.0;
+                                resize_deadline = None;
                                 unsafe {
                                     let _ = root_visual.SetContent(&sr.swapchain);
                                     let _ = dcomp_device.Commit();
@@ -832,7 +849,13 @@ pub fn run() -> Result<(), String> {
                         let target_w = target_size.width;
                         let target_h = target_size.height;
 
-                        if (rs.last_scale - interaction_state.scale_factor).abs() > f32::EPSILON {
+                        let scale_changed =
+                            (rs.last_scale - interaction_state.scale_factor).abs() > f32::EPSILON;
+                        let resize_due = resize_deadline.is_some_and(|deadline| now >= deadline);
+                        if !scale_changed {
+                            resize_deadline = None;
+                        } else if resize_due {
+                            resize_deadline = None;
                             if target_w == sr.width && target_h == sr.height {
                                 rs.last_scale = interaction_state.scale_factor;
                             } else {
@@ -911,14 +934,15 @@ pub fn run() -> Result<(), String> {
                                     rs.first_render_logged = true;
                                 }
 
-                                if !interaction_state.is_dragging()
-                                    && interaction_state.should_update_alpha()
-                                {
+                                if interaction_state.enabled && !interaction_state.is_dragging() {
+                                    let schedule_copy =
+                                        interaction_state.should_update_alpha(Instant::now());
                                     update_alpha(
                                         &context,
                                         sr,
                                         &mut interaction_state,
                                         &mut rs.alpha_buf,
+                                        schedule_copy,
                                     );
                                 }
                             } else {
@@ -942,10 +966,14 @@ pub fn run() -> Result<(), String> {
                         rs.pacer.presented(Instant::now());
                     }
 
-                    if let Some(deadline) =
-                        rs.pacer
-                            .next_wake(Instant::now(), handle_ok && window_visible, presented_frame)
-                    {
+                    let next_wake = rs
+                        .pacer
+                        .next_wake(Instant::now(), handle_ok && window_visible, presented_frame);
+                    let next_wake = match (next_wake, resize_deadline) {
+                        (Some(frame), Some(resize)) => Some(frame.min(resize)),
+                        (deadline, None) | (None, deadline) => deadline,
+                    };
+                    if let Some(deadline) = next_wake {
                         elwt.set_control_flow(ControlFlow::WaitUntil(deadline));
                     } else {
                         elwt.set_control_flow(ControlFlow::Poll);

@@ -19,6 +19,8 @@ const SENDER_NAME_CAPACITY: usize = 256;
 const MAX_SENDER_LIST_BYTES: usize = SENDER_NAME_CAPACITY * 4096;
 const SHARED_TEXTURE_INFO_SIZE: usize = 280;
 const METADATA_LOCK_TIMEOUT_MS: u32 = 67;
+const CONNECTED_METADATA_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const DISCONNECTED_METADATA_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct SenderName(Vec<u8>);
@@ -111,6 +113,7 @@ pub struct SpoutReceiver {
     selected: Option<SenderName>,
     current: Option<SenderInfo>,
     generation: u64,
+    next_metadata_poll: Instant,
     next_discovery: Instant,
 }
 
@@ -120,6 +123,7 @@ impl SpoutReceiver {
             selected: None,
             current: None,
             generation: 0,
+            next_metadata_poll: Instant::now(),
             next_discovery: Instant::now(),
         }
     }
@@ -149,10 +153,17 @@ impl SpoutReceiver {
     pub fn select(&mut self, sender: SenderName) {
         self.selected = Some(sender);
         self.current = None;
+        self.next_metadata_poll = Instant::now();
         self.next_discovery = Instant::now();
     }
 
     pub fn poll(&mut self) -> io::Result<bool> {
+        let now = Instant::now();
+        if now < self.next_metadata_poll {
+            return Ok(self.current.is_some());
+        }
+        self.schedule_metadata_poll(now, self.current.is_some());
+
         let result = self.selected.as_ref().map(read_sender_info);
         match result {
             None => self.discover_sender(),
@@ -165,19 +176,29 @@ impl SpoutReceiver {
                     self.generation = self.generation.wrapping_add(1);
                 }
                 self.current = Some(info);
+                self.schedule_metadata_poll(now, true);
                 Ok(true)
             }
             Some(Ok(_)) => {
                 self.current = None;
+                self.schedule_metadata_poll(now, false);
                 Ok(false)
             }
             Some(Err(error)) if error.kind() == io::ErrorKind::NotFound => {
                 self.current = None;
-                self.discover_sender()
+                let connected = self.discover_sender()?;
+                self.schedule_metadata_poll(now, connected);
+                Ok(connected)
             }
-            Some(Err(error)) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Some(Err(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+                Ok(self.current.is_some())
+            }
             Some(Err(error)) => Err(error),
         }
+    }
+
+    fn schedule_metadata_poll(&mut self, now: Instant, connected: bool) {
+        self.next_metadata_poll = now + metadata_poll_interval(connected);
     }
 
     fn discover_sender(&mut self) -> io::Result<bool> {
@@ -197,6 +218,7 @@ impl SpoutReceiver {
         self.selected = Some(name);
         self.current = Some(info);
         self.generation = self.generation.wrapping_add(1);
+        self.schedule_metadata_poll(Instant::now(), true);
         Ok(true)
     }
 
@@ -213,6 +235,14 @@ impl SpoutReceiver {
 
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+}
+
+fn metadata_poll_interval(connected: bool) -> Duration {
+    if connected {
+        CONNECTED_METADATA_POLL_INTERVAL
+    } else {
+        DISCONNECTED_METADATA_POLL_INTERVAL
     }
 }
 
@@ -456,5 +486,14 @@ mod tests {
         };
 
         assert!(resource_changed(&previous, &current));
+    }
+
+    #[test]
+    fn disconnected_metadata_polling_is_less_frequent() {
+        assert!(metadata_poll_interval(false) > metadata_poll_interval(true));
+        assert_eq!(
+            metadata_poll_interval(true),
+            CONNECTED_METADATA_POLL_INTERVAL
+        );
     }
 }
