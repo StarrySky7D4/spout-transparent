@@ -1,5 +1,5 @@
 use std::mem::size_of;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use windows::core::{w, Error, Result, PCWSTR};
@@ -12,8 +12,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetWindowLongW, LoadIconW,
     PostMessageW, RegisterWindowMessageW, SetForegroundWindow, SetWindowLongW, TrackPopupMenu,
     GWL_EXSTYLE, HMENU, IDI_APPLICATION, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
-    MF_UNCHECKED, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONDBLCLK,
-    WM_NULL, WM_RBUTTONUP, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    MF_UNCHECKED, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU,
+    WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
 use crate::config::FrameRate;
@@ -43,6 +43,7 @@ const STATE_HAS_SOURCE: u32 = 1 << 5;
 static PENDING_COMMAND: AtomicU32 = AtomicU32::new(0);
 static MENU_STATE: AtomicU32 = AtomicU32::new(0);
 static TASKBAR_CREATED_MESSAGE: AtomicU32 = AtomicU32::new(0);
+static MENU_OPEN: AtomicBool = AtomicBool::new(false);
 static SOURCE_MENU: Mutex<SourceMenuState> = Mutex::new(SourceMenuState {
     names: Vec::new(),
     selected: None,
@@ -185,9 +186,7 @@ unsafe extern "system" fn tray_subclass(
     if message == TRAY_CALLBACK_MESSAGE {
         match lparam.0 as u32 {
             WM_RBUTTONUP | WM_CONTEXTMENU => {
-                if let Err(error) = show_context_menu(hwnd) {
-                    log::error!("Tray menu failed: {error:?}");
-                }
+                show_context_menu_async(hwnd);
                 return LRESULT(0);
             }
             WM_LBUTTONDBLCLK => {
@@ -207,6 +206,44 @@ unsafe extern "system" fn tray_subclass(
     }
 
     DefSubclassProc(hwnd, message, wparam, lparam)
+}
+
+fn show_context_menu_async(hwnd: HWND) {
+    if MENU_OPEN
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    // TrackPopupMenu blocks until the menu closes. Run it on a dedicated thread
+    // so the winit event loop can keep polling Spout and presenting frames.
+    let hwnd_value = hwnd.0 as isize;
+    let spawn_result = std::thread::Builder::new()
+        .name("spout-tray-menu".to_string())
+        .spawn(move || {
+            let _guard = MenuOpenGuard;
+            let hwnd = HWND(hwnd_value as *mut std::ffi::c_void);
+            if let Err(error) = show_context_menu(hwnd) {
+                log::error!("Tray menu failed: {error:?}");
+            }
+            unsafe {
+                let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+            }
+        });
+
+    if let Err(error) = spawn_result {
+        MENU_OPEN.store(false, Ordering::Release);
+        log::error!("Failed to start tray menu thread: {error}");
+    }
+}
+
+struct MenuOpenGuard;
+
+impl Drop for MenuOpenGuard {
+    fn drop(&mut self) {
+        MENU_OPEN.store(false, Ordering::Release);
+    }
 }
 
 fn show_context_menu(hwnd: HWND) -> Result<()> {
@@ -307,7 +344,7 @@ fn show_context_menu(hwnd: HWND) -> Result<()> {
         let _ = SetForegroundWindow(hwnd);
         let command = TrackPopupMenu(
             menu.handle(),
-            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            TPM_NONOTIFY | TPM_RETURNCMD | TPM_RIGHTBUTTON,
             cursor.x,
             cursor.y,
             0,
@@ -318,7 +355,6 @@ fn show_context_menu(hwnd: HWND) -> Result<()> {
         if command != 0 {
             PENDING_COMMAND.store(command, Ordering::Release);
         }
-        let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
     }
 
     Ok(())
