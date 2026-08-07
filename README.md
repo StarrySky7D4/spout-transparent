@@ -161,6 +161,10 @@ cargo run --locked
 
 这是预期行为。程序作为托盘应用运行，请在系统托盘或其折叠区域中查找 `Spout Transparent` 图标；右键可显示窗口或退出程序。
 
+## 许可证
+
+本项目原创代码采用 [Apache License 2.0](LICENSE) 许可。第三方组件和兼容性实现仍遵循各自的许可证及归属要求。
+
 ## 第三方声明
 
 纯 Rust 接收端与 Spout2 的公开共享内存和纹理同步协议兼容。相关版权与许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
