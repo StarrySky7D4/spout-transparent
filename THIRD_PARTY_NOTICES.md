@@ -1,5 +1,7 @@
 # Third-party notices
 
+The original code of spout-transparent is licensed under the Apache License, Version 2.0. The following notice applies only to the identified third-party project and does not change the license of the project as a whole.
+
 The Rust receiver implements compatibility with the public Spout2 shared-memory and shared-texture protocol. The following license is retained for the Spout2 protocol implementation used as a reference.
 
 ## Spout2
