@@ -12,7 +12,9 @@ use windows_sys::Win32::System::Memory::{
     MapViewOfFile, OpenFileMappingA, UnmapViewOfFile, VirtualQuery, FILE_MAP_READ,
     MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS,
 };
-use windows_sys::Win32::System::Threading::{CreateMutexA, ReleaseMutex, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{
+    CreateMutexA, CreateSemaphoreA, ReleaseMutex, ReleaseSemaphore, WaitForSingleObject,
+};
 
 const SENDER_NAMES_MAP: &[u8] = b"SpoutSenderNames";
 const SENDER_NAME_CAPACITY: usize = 256;
@@ -37,6 +39,70 @@ impl SenderName {
     pub fn display_name(&self) -> String {
         String::from_utf8_lossy(&self.0).into_owned()
     }
+
+    fn with_suffix(&self, suffix: &[u8]) -> io::Result<CString> {
+        let mut name = Vec::with_capacity(self.0.len() + suffix.len());
+        name.extend_from_slice(&self.0);
+        name.extend_from_slice(suffix);
+        CString::new(name)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "sender name contains NUL"))
+    }
+}
+
+pub struct FrameCounter {
+    handle: HANDLE,
+    last_count: i32,
+}
+
+impl FrameCounter {
+    pub fn for_sender(sender: &SenderName) -> io::Result<Self> {
+        let name = sender.with_suffix(b"_Count_Semaphore")?;
+        // Spout deliberately lets either endpoint create the semaphore. A count
+        // of zero after the probe means the sender is not using frame counting.
+        let handle = unsafe { CreateSemaphoreA(ptr::null(), 1, i32::MAX, name.as_ptr().cast()) };
+        if handle.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(Self {
+                handle,
+                last_count: 0,
+            })
+        }
+    }
+
+    pub fn is_new_frame(&mut self) -> bool {
+        match unsafe { WaitForSingleObject(self.handle, 0) } {
+            WAIT_OBJECT_0 => {
+                let mut count_after_wait = 0;
+                if unsafe { ReleaseSemaphore(self.handle, 1, &mut count_after_wait) } == 0 {
+                    return true;
+                }
+                frame_count_is_new(&mut self.last_count, count_after_wait)
+            }
+            // A broken or concurrently unavailable counter must not freeze a
+            // receiver. This is the same compatibility fallback used by Spout.
+            _ => true,
+        }
+    }
+}
+
+impl Drop for FrameCounter {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+fn frame_count_is_new(last_count: &mut i32, current_count: i32) -> bool {
+    if current_count == 0 {
+        return true;
+    }
+    if current_count == *last_count {
+        return false;
+    }
+    *last_count = current_count;
+    true
 }
 
 impl fmt::Debug for SenderName {
@@ -495,5 +561,21 @@ mod tests {
             metadata_poll_interval(true),
             CONNECTED_METADATA_POLL_INTERVAL
         );
+    }
+
+    #[test]
+    fn zero_frame_count_keeps_legacy_senders_live() {
+        let mut last = 0;
+        assert!(frame_count_is_new(&mut last, 0));
+        assert!(frame_count_is_new(&mut last, 0));
+        assert_eq!(last, 0);
+    }
+
+    #[test]
+    fn repeated_nonzero_frame_count_is_not_new() {
+        let mut last = 0;
+        assert!(frame_count_is_new(&mut last, 7));
+        assert!(!frame_count_is_new(&mut last, 7));
+        assert!(frame_count_is_new(&mut last, 9));
     }
 }

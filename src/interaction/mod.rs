@@ -4,7 +4,6 @@ pub use hook_thread::{handle_passthrough_event, MouseHook, PassthroughEvent};
 use serde::Deserialize;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, MOD_SHIFT};
@@ -409,11 +408,15 @@ impl InteractionState {
         true
     }
 
-    pub fn update_alpha_mask(&mut self, alpha: Vec<u8>, width: u32, height: u32) {
-        let arc: Arc<[u8]> = alpha.into_boxed_slice().into();
-        if let Some(hook) = &self.mouse_hook {
-            hook.update_mask(arc, width, height);
-        }
+    pub fn update_alpha_mask(
+        &mut self,
+        alpha: Vec<u8>,
+        width: u32,
+        height: u32,
+    ) -> Option<Vec<u8>> {
+        self.mouse_hook
+            .as_ref()
+            .and_then(|hook| hook.update_mask(alpha, width, height))
     }
 }
 
