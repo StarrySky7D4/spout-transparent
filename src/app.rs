@@ -27,7 +27,7 @@ use crate::dx::pipeline::create_pipeline;
 use crate::dx::staging::AlphaReadback;
 use crate::dx::swapchain::create_swapchain;
 use crate::interaction;
-use crate::spout::{NamedMutex, SenderName, SpoutReceiver};
+use crate::spout::{FrameCounter, NamedMutex, SenderName, SpoutReceiver};
 use crate::tray::{TrayAction, TrayIcon, TrayState};
 
 struct ComGuard;
@@ -44,12 +44,10 @@ impl Drop for ComGuard {
     }
 }
 
-const RESIZE_DEBOUNCE: Duration = Duration::from_millis(75);
-
 struct SwapchainResources {
     swapchain: IDXGISwapChain1,
     rtv: ID3D11RenderTargetView,
-    alpha_readback: AlphaReadback,
+    alpha_readback: Option<AlphaReadback>,
     width: u32,
     height: u32,
 }
@@ -57,30 +55,29 @@ struct SwapchainResources {
 impl SwapchainResources {
     fn new(device: &ID3D11Device, width: u32, height: u32) -> windows::core::Result<Self> {
         let (swapchain, rtv) = create_swapchain(device, width, height)?;
-        let alpha_readback = AlphaReadback::new(device, width, height)?;
         Ok(Self {
             swapchain,
             rtv,
-            alpha_readback,
+            alpha_readback: None,
             width,
             height,
         })
     }
 
-    fn rebuild(
+    fn set_alpha_enabled(
         &mut self,
         device: &ID3D11Device,
-        width: u32,
-        height: u32,
-    ) -> windows::core::Result<()> {
-        let (swapchain, rtv) = create_swapchain(device, width, height)?;
-        let alpha_readback = AlphaReadback::new(device, width, height)?;
-        self.swapchain = swapchain;
-        self.rtv = rtv;
-        self.alpha_readback = alpha_readback;
-        self.width = width;
-        self.height = height;
-        Ok(())
+        enabled: bool,
+    ) -> windows::core::Result<bool> {
+        if !enabled {
+            self.alpha_readback = None;
+            return Ok(false);
+        }
+        if self.alpha_readback.is_none() {
+            self.alpha_readback = Some(AlphaReadback::new(device, self.width, self.height)?);
+            return Ok(true);
+        }
+        Ok(false)
     }
 }
 
@@ -90,6 +87,7 @@ struct SenderResources {
     srv: ID3D11ShaderResourceView,
     keyed_mutex: Option<IDXGIKeyedMutex>,
     named_mutex: Option<NamedMutex>,
+    frame_counter: Option<FrameCounter>,
     width: u32,
     height: u32,
 }
@@ -135,6 +133,13 @@ impl SenderResources {
         } else {
             None
         };
+        let frame_counter = match FrameCounter::for_sender(sender_name) {
+            Ok(counter) => Some(counter),
+            Err(error) => {
+                log::warn!("Spout frame counter unavailable for '{sender_name}': {error}");
+                None
+            }
+        };
         log::info!(
             "KeyedMutex: {}",
             if keyed_mutex.is_some() {
@@ -149,6 +154,7 @@ impl SenderResources {
             srv,
             keyed_mutex,
             named_mutex,
+            frame_counter,
             width: desc.Width,
             height: desc.Height,
         })
@@ -423,36 +429,36 @@ fn render_frame(
 fn update_alpha(
     context: &ID3D11DeviceContext,
     swapchain_res: &mut SwapchainResources,
+    pipeline: &crate::dx::pipeline::Pipeline,
+    source: &ID3D11ShaderResourceView,
     interaction_state: &mut interaction::InteractionState,
     alpha_buf: &mut Vec<u8>,
-    schedule_copy: bool,
+    schedule_extract: bool,
 ) {
-    match swapchain_res.alpha_readback.try_read(context, alpha_buf) {
+    let Some(readback) = swapchain_res.alpha_readback.as_mut() else {
+        return;
+    };
+    match readback.try_read(context, alpha_buf) {
         Ok(true) => {
-            interaction_state.update_alpha_mask(
+            let reusable = interaction_state.update_alpha_mask(
                 std::mem::take(alpha_buf),
                 swapchain_res.width,
                 swapchain_res.height,
             );
+            if let Some(reusable) = reusable {
+                *alpha_buf = reusable;
+            }
         }
         Ok(false) => {}
         Err(error) => log::warn!("Alpha readback failed: {error:?}"),
     }
 
-    if !schedule_copy {
+    if !schedule_extract {
         return;
     }
 
-    match unsafe { swapchain_res.swapchain.GetBuffer::<ID3D11Texture2D>(0) } {
-        Ok(backbuffer) => {
-            if let Err(error) = swapchain_res
-                .alpha_readback
-                .enqueue_copy(context, &backbuffer)
-            {
-                log::warn!("Alpha readback copy failed: {error:?}");
-            }
-        }
-        Err(error) => log::warn!("Failed to get backbuffer for alpha readback: {error:?}"),
+    if let Err(error) = readback.enqueue_extract(context, pipeline, source) {
+        log::warn!("Alpha R8 extraction failed: {error:?}");
     }
 }
 
@@ -589,6 +595,7 @@ pub fn run() -> Result<(), String> {
     let device = app_init.device.clone();
     let dcomp_device = dcomp.device.clone();
     let root_visual = dcomp.root_visual.clone();
+    let scale_transform = dcomp.scale_transform.clone();
 
     let mut rs = RenderState {
         spout: app_init.spout,
@@ -611,7 +618,7 @@ pub fn run() -> Result<(), String> {
     let mut available_senders = Vec::new();
     let mut menu_selected_source: Option<SenderName> = None;
     let mut next_sender_refresh = Instant::now();
-    let mut resize_deadline: Option<Instant> = None;
+    let mut redraw_requested = true;
 
     #[allow(deprecated)]
     event_loop
@@ -638,13 +645,7 @@ pub fn run() -> Result<(), String> {
                         interaction_state.handle_keyboard(ke, hwnd);
                     }
                     WindowEvent::MouseWheel { delta, .. } => {
-                        let previous_scale = interaction_state.scale_factor;
                         interaction_state.handle_scroll(delta);
-                        if (previous_scale - interaction_state.scale_factor).abs()
-                            > f32::EPSILON
-                        {
-                            resize_deadline = Some(Instant::now() + RESIZE_DEBOUNCE);
-                        }
                     }
                     WindowEvent::MouseInput { state, button, .. } => {
                         interaction_state.handle_mouse_input(state, button, &window);
@@ -683,6 +684,7 @@ pub fn run() -> Result<(), String> {
                                     window_visible = window_requested_visible;
                                     window.set_visible(window_visible);
                                     if window_visible {
+                                        redraw_requested = true;
                                         rs.pacer.request_frame();
                                     }
                                 }
@@ -791,8 +793,9 @@ pub fn run() -> Result<(), String> {
                                 rs.base_height = new_sender.height;
                                 interaction_state.scale_factor = 1.0;
                                 rs.last_scale = 1.0;
-                                resize_deadline = None;
                                 unsafe {
+                                    let _ = scale_transform.SetScaleX2(1.0);
+                                    let _ = scale_transform.SetScaleY2(1.0);
                                     let _ = root_visual.SetContent(&sr.swapchain);
                                     let _ = dcomp_device.Commit();
                                 }
@@ -803,6 +806,7 @@ pub fn run() -> Result<(), String> {
                                 rs.current_handle = new_handle;
                                 rs.current_sender_name = Some(sender_name.clone());
                                 rs.current_sender_generation = new_sender_generation;
+                                redraw_requested = true;
                                 rs.pacer.request_frame();
                                 log::info!("[Frame {}] Texture rebuild complete", rs.frame_count);
                             }
@@ -824,6 +828,7 @@ pub fn run() -> Result<(), String> {
                             window_should_be_visible(source_available, window_requested_visible);
                         window.set_visible(window_visible);
                         if window_visible {
+                            redraw_requested = true;
                             rs.pacer.request_frame();
                             log::info!("Spout sender available; showing the window");
                         } else {
@@ -842,41 +847,52 @@ pub fn run() -> Result<(), String> {
                     let mut frame_update = FrameUpdate::Unchanged;
 
                     if let (Some(sr), Some(sn)) =
-                        (rs.swapchain_res.as_mut(), rs.sender.as_ref())
+                        (rs.swapchain_res.as_mut(), rs.sender.as_mut())
                     {
                         let target_size =
                             interaction_state.scaled_size(rs.base_width, rs.base_height);
-                        let target_w = target_size.width;
-                        let target_h = target_size.height;
 
                         let scale_changed =
                             (rs.last_scale - interaction_state.scale_factor).abs() > f32::EPSILON;
-                        let resize_due = resize_deadline.is_some_and(|deadline| now >= deadline);
-                        if !scale_changed {
-                            resize_deadline = None;
-                        } else if resize_due {
-                            resize_deadline = None;
-                            if target_w == sr.width && target_h == sr.height {
-                                rs.last_scale = interaction_state.scale_factor;
+                        if scale_changed {
+                            let scale = interaction_state.scale_factor;
+                            let transform_result = unsafe {
+                                scale_transform
+                                    .SetScaleX2(scale)
+                                    .and_then(|_| scale_transform.SetScaleY2(scale))
+                                    .and_then(|_| dcomp_device.Commit())
+                            };
+                            if let Err(error) = transform_result {
+                                interaction_state.scale_factor = rs.last_scale;
+                                log::warn!(
+                                    "DirectComposition scale to {scale:.3} failed; keeping the previous scale: {error:?}"
+                                );
                             } else {
-                                match sr.rebuild(&device, target_w, target_h) {
-                                    Ok(()) => {
-                                        rs.last_scale = interaction_state.scale_factor;
-                                        unsafe {
-                                            let _ = root_visual.SetContent(&sr.swapchain);
-                                            let _ = dcomp_device.Commit();
-                                        }
-                                        let _ = window.request_inner_size(target_size);
-                                        rs.pacer.request_frame();
-                                    }
-                                    Err(error) => {
-                                        interaction_state.scale_factor = rs.last_scale;
-                                        log::warn!(
-                                            "Resize to {target_w}x{target_h} failed; keeping the previous scale: {error:?}"
-                                        );
-                                    }
-                                }
+                                rs.last_scale = interaction_state.scale_factor;
+                                let _ = window.request_inner_size(target_size);
                             }
+                        }
+
+                        match sr.set_alpha_enabled(&device, interaction_state.enabled) {
+                            Ok(true) => {
+                                redraw_requested = true;
+                                rs.pacer.request_frame();
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                log::warn!("Could not create Alpha R8 readback resources: {error:?}")
+                            }
+                        }
+                        if interaction_state.enabled {
+                            update_alpha(
+                                &context,
+                                sr,
+                                &rs.pipeline,
+                                &sn.srv,
+                                &mut interaction_state,
+                                &mut rs.alpha_buf,
+                                false,
+                            );
                         }
 
                         if window_visible && recv && rs.pacer.is_due(Instant::now()) {
@@ -895,15 +911,21 @@ pub fn run() -> Result<(), String> {
                                 || (sn.keyed_mutex.is_none() && named_mutex_guard.is_some());
 
                             if owns_sender_texture {
-                                render_frame(
-                                    &context,
-                                    &rs.pipeline,
-                                    &sn.srv,
-                                    &sr.rtv,
-                                    sr.width,
-                                    sr.height,
-                                );
-                                frame_update = FrameUpdate::Rendered;
+                                let sender_has_new_frame = sn
+                                    .frame_counter
+                                    .as_mut()
+                                    .is_none_or(FrameCounter::is_new_frame);
+                                if redraw_requested || sender_has_new_frame {
+                                    render_frame(
+                                        &context,
+                                        &rs.pipeline,
+                                        &sn.srv,
+                                        &sr.rtv,
+                                        sr.width,
+                                        sr.height,
+                                    );
+                                    redraw_requested = false;
+                                    frame_update = FrameUpdate::Rendered;
 
                                 #[cfg(debug_assertions)]
                                 if !rs.first_render_logged {
@@ -934,16 +956,21 @@ pub fn run() -> Result<(), String> {
                                     rs.first_render_logged = true;
                                 }
 
-                                if interaction_state.enabled && !interaction_state.is_dragging() {
-                                    let schedule_copy =
-                                        interaction_state.should_update_alpha(Instant::now());
-                                    update_alpha(
-                                        &context,
-                                        sr,
-                                        &mut interaction_state,
-                                        &mut rs.alpha_buf,
-                                        schedule_copy,
-                                    );
+                                    if interaction_state.enabled
+                                        && !interaction_state.is_dragging()
+                                    {
+                                        let schedule_extract = interaction_state
+                                            .should_update_alpha(Instant::now());
+                                        update_alpha(
+                                            &context,
+                                            sr,
+                                            &rs.pipeline,
+                                            &sn.srv,
+                                            &mut interaction_state,
+                                            &mut rs.alpha_buf,
+                                            schedule_extract,
+                                        );
+                                    }
                                 }
                             } else {
                                 log::trace!("Skipped frame: sender keyed mutex is busy");
@@ -969,10 +996,6 @@ pub fn run() -> Result<(), String> {
                     let next_wake = rs
                         .pacer
                         .next_wake(Instant::now(), handle_ok && window_visible, presented_frame);
-                    let next_wake = match (next_wake, resize_deadline) {
-                        (Some(frame), Some(resize)) => Some(frame.min(resize)),
-                        (deadline, None) | (None, deadline) => deadline,
-                    };
                     if let Some(deadline) = next_wake {
                         elwt.set_control_flow(ControlFlow::WaitUntil(deadline));
                     } else {

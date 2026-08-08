@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -20,9 +20,26 @@ pub struct PassthroughEvent {
 }
 
 enum HookCommand {
-    UpdateMask(Arc<[u8]>, u32, u32),
     SetEnabled(bool),
     Shutdown,
+}
+
+struct MaskUpdate {
+    alpha: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Default)]
+struct MaskMailbox {
+    pending: Option<MaskUpdate>,
+    recycled: Option<Vec<u8>>,
+}
+
+fn lock_mailbox(mailbox: &Mutex<MaskMailbox>) -> MutexGuard<'_, MaskMailbox> {
+    mailbox
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 static HOOK_THREAD_ID: AtomicUsize = AtomicUsize::new(0);
@@ -31,7 +48,7 @@ const HOOK_START_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct HookThreadState {
     hwnd: HWND,
-    mask_alpha: Arc<[u8]>,
+    mask_alpha: Vec<u8>,
     mask_width: u32,
     mask_height: u32,
     enabled: bool,
@@ -40,6 +57,7 @@ struct HookThreadState {
 
 pub struct MouseHook {
     cmd_tx: Sender<HookCommand>,
+    mask_mailbox: Arc<Mutex<MaskMailbox>>,
     thread_handle: Option<JoinHandle<()>>,
     evt_rx: Receiver<PassthroughEvent>,
 }
@@ -49,15 +67,17 @@ impl MouseHook {
         let (cmd_tx, cmd_rx) = mpsc::channel::<HookCommand>();
         let (evt_tx, evt_rx) = mpsc::channel::<PassthroughEvent>();
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+        let mask_mailbox = Arc::new(Mutex::new(MaskMailbox::default()));
 
         // Store hwnd as raw value for cross-thread safety
         let hwnd_raw = hwnd.0 as isize;
 
+        let thread_mask_mailbox = Arc::clone(&mask_mailbox);
         let handle = thread::Builder::new()
             .name("mouse_hook".into())
             .spawn(move || {
                 let hwnd = HWND(hwnd_raw as *mut _);
-                hook_thread_entry(hwnd, cmd_rx, evt_tx, ready_tx);
+                hook_thread_entry(hwnd, cmd_rx, evt_tx, ready_tx, thread_mask_mailbox);
             })
             .map_err(|e| format!("Failed to spawn hook thread: {e}"))?;
 
@@ -80,19 +100,26 @@ impl MouseHook {
 
         Ok(Self {
             cmd_tx,
+            mask_mailbox,
             thread_handle: Some(handle),
             evt_rx,
         })
     }
 
-    pub fn update_mask(&self, alpha: Arc<[u8]>, width: u32, height: u32) {
-        if self
-            .cmd_tx
-            .send(HookCommand::UpdateMask(alpha, width, height))
-            .is_ok()
-        {
-            wake_hook_thread();
-        }
+    pub fn update_mask(&self, alpha: Vec<u8>, width: u32, height: u32) -> Option<Vec<u8>> {
+        let mut mailbox = lock_mailbox(&self.mask_mailbox);
+        let replaced = mailbox
+            .pending
+            .replace(MaskUpdate {
+                alpha,
+                width,
+                height,
+            })
+            .map(|update| update.alpha);
+        let reusable = replaced.or_else(|| mailbox.recycled.take());
+        drop(mailbox);
+        wake_hook_thread();
+        reusable
     }
 
     pub fn set_enabled(&self, enabled: bool) {
@@ -127,6 +154,7 @@ fn hook_thread_entry(
     cmd_rx: Receiver<HookCommand>,
     evt_tx: Sender<PassthroughEvent>,
     ready_tx: mpsc::SyncSender<Result<(), String>>,
+    mask_mailbox: Arc<Mutex<MaskMailbox>>,
 ) {
     HOOK_THREAD_ID.store(
         unsafe { windows::Win32::System::Threading::GetCurrentThreadId() } as usize,
@@ -135,7 +163,7 @@ fn hook_thread_entry(
 
     let mut state = HookThreadState {
         hwnd,
-        mask_alpha: Arc::new([]),
+        mask_alpha: Vec::new(),
         mask_width: 0,
         mask_height: 0,
         enabled: false,
@@ -172,14 +200,11 @@ fn hook_thread_entry(
     }
 
     loop {
+        apply_latest_mask(&mut state, &mask_mailbox);
+
         // Process pending commands
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
-                HookCommand::UpdateMask(alpha, w, h) => {
-                    state.mask_alpha = alpha;
-                    state.mask_width = w;
-                    state.mask_height = h;
-                }
                 HookCommand::SetEnabled(e) => {
                     state.enabled = e;
                 }
@@ -212,6 +237,26 @@ fn hook_thread_entry(
     }
     HOOK_STATE_PTR.store(0, Ordering::Release);
     HOOK_THREAD_ID.store(0, Ordering::Release);
+}
+
+fn apply_latest_mask(state: &mut HookThreadState, mailbox: &Mutex<MaskMailbox>) {
+    let mut mailbox = lock_mailbox(mailbox);
+    let Some(mut update) = mailbox.pending.take() else {
+        return;
+    };
+
+    std::mem::swap(&mut state.mask_alpha, &mut update.alpha);
+    state.mask_width = update.width;
+    state.mask_height = update.height;
+
+    if !update.alpha.is_empty()
+        && mailbox
+            .recycled
+            .as_ref()
+            .is_none_or(|buffer| update.alpha.capacity() > buffer.capacity())
+    {
+        mailbox.recycled = Some(update.alpha);
+    }
 }
 
 static HOOK_STATE_PTR: AtomicUsize = AtomicUsize::new(0);
@@ -281,14 +326,18 @@ unsafe extern "system" fn hook_callback(code: i32, wparam: WPARAM, lparam: LPARA
         return CallNextHookEx(None, code, wparam, lparam);
     }
 
-    let px = (cx as u32 * state.mask_width) / win_w;
-    let py = (cy as u32 * state.mask_height) / win_h;
-    if px >= state.mask_width || py >= state.mask_height {
+    let Some(alpha) = sample_scaled_alpha(
+        &state.mask_alpha,
+        state.mask_width,
+        state.mask_height,
+        win_w,
+        win_h,
+        cx as u32,
+        cy as u32,
+    ) else {
         return CallNextHookEx(None, code, wparam, lparam);
-    }
-
-    let idx = (py * state.mask_width + px) as usize;
-    let is_transparent = idx < state.mask_alpha.len() && state.mask_alpha[idx] < ALPHA_THRESHOLD;
+    };
+    let is_transparent = alpha < ALPHA_THRESHOLD as f32;
 
     if is_transparent {
         let _ = state.evt_tx.send(PassthroughEvent {
@@ -300,6 +349,44 @@ unsafe extern "system" fn hook_callback(code: i32, wparam: WPARAM, lparam: LPARA
     }
 
     CallNextHookEx(None, code, wparam, lparam)
+}
+
+fn sample_scaled_alpha(
+    alpha: &[u8],
+    source_width: u32,
+    source_height: u32,
+    window_width: u32,
+    window_height: u32,
+    window_x: u32,
+    window_y: u32,
+) -> Option<f32> {
+    let expected_len = (source_width as usize).checked_mul(source_height as usize)?;
+    if source_width == 0
+        || source_height == 0
+        || window_width == 0
+        || window_height == 0
+        || window_x >= window_width
+        || window_y >= window_height
+        || alpha.len() < expected_len
+    {
+        return None;
+    }
+
+    // Match normalized-coordinate linear texture sampling used by the render path.
+    let source_x = ((window_x as f32 + 0.5) * source_width as f32 / window_width as f32 - 0.5)
+        .clamp(0.0, source_width.saturating_sub(1) as f32);
+    let source_y = ((window_y as f32 + 0.5) * source_height as f32 / window_height as f32 - 0.5)
+        .clamp(0.0, source_height.saturating_sub(1) as f32);
+    let x0 = source_x.floor() as u32;
+    let y0 = source_y.floor() as u32;
+    let x1 = (x0 + 1).min(source_width - 1);
+    let y1 = (y0 + 1).min(source_height - 1);
+    let tx = source_x - x0 as f32;
+    let ty = source_y - y0 as f32;
+    let at = |x: u32, y: u32| alpha[(y * source_width + x) as usize] as f32;
+    let top = at(x0, y0) + (at(x1, y0) - at(x0, y0)) * tx;
+    let bottom = at(x0, y1) + (at(x1, y1) - at(x0, y1)) * tx;
+    Some(top + (bottom - top) * ty)
 }
 
 pub fn handle_passthrough_event(ev: &PassthroughEvent, hwnd: HWND) {
@@ -365,6 +452,56 @@ mod tests {
         assert_eq!(
             forwarded_wparam(WM_MOUSEWHEEL, 0xFF88_0000).0,
             0xFF88_0000usize
+        );
+    }
+
+    #[test]
+    fn scaled_alpha_uses_linear_sampling_at_edges() {
+        let alpha = [0, 255];
+        assert_eq!(sample_scaled_alpha(&alpha, 2, 1, 4, 1, 0, 0), Some(0.0));
+        assert_eq!(sample_scaled_alpha(&alpha, 2, 1, 4, 1, 3, 0), Some(255.0));
+        assert_eq!(sample_scaled_alpha(&alpha, 2, 1, 4, 1, 1, 0), Some(63.75));
+        assert_eq!(sample_scaled_alpha(&alpha, 2, 1, 4, 1, 2, 0), Some(191.25));
+    }
+
+    #[test]
+    fn mask_mailbox_keeps_only_the_latest_update() {
+        let mailbox = Mutex::new(MaskMailbox::default());
+        {
+            let mut locked = lock_mailbox(&mailbox);
+            locked.pending = Some(MaskUpdate {
+                alpha: vec![1],
+                width: 1,
+                height: 1,
+            });
+            let replaced = locked.pending.replace(MaskUpdate {
+                alpha: vec![2],
+                width: 1,
+                height: 1,
+            });
+            assert_eq!(replaced.unwrap().alpha, [1]);
+        }
+        let mut state = HookThreadState {
+            hwnd: HWND::default(),
+            mask_alpha: Vec::new(),
+            mask_width: 0,
+            mask_height: 0,
+            enabled: false,
+            evt_tx: mpsc::channel().0,
+        };
+        apply_latest_mask(&mut state, &mailbox);
+        assert_eq!(state.mask_alpha, [2]);
+
+        lock_mailbox(&mailbox).pending = Some(MaskUpdate {
+            alpha: vec![3],
+            width: 1,
+            height: 1,
+        });
+        apply_latest_mask(&mut state, &mailbox);
+        assert_eq!(state.mask_alpha, [3]);
+        assert_eq!(
+            lock_mailbox(&mailbox).recycled.as_deref(),
+            Some([2].as_slice())
         );
     }
 }

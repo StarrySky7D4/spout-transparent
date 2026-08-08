@@ -1,11 +1,12 @@
 use std::collections::VecDeque;
 
 use windows::core::Interface;
+use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D11::*;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM;
 use windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAS_STILL_DRAWING;
 
-const READBACK_BUFFER_COUNT: usize = 3;
+const READBACK_BUFFER_COUNT: usize = 2;
 
 struct ReadbackSlot {
     texture: ID3D11Texture2D,
@@ -13,6 +14,7 @@ struct ReadbackSlot {
 }
 
 pub struct AlphaReadback {
+    target_rtv: ID3D11RenderTargetView,
     slots: Vec<ReadbackSlot>,
     pending: VecDeque<usize>,
     next_write: usize,
@@ -26,32 +28,47 @@ impl AlphaReadback {
             return Err(crate::dx::invalid_argument());
         }
 
-        let desc = D3D11_TEXTURE2D_DESC {
+        let target_desc = D3D11_TEXTURE2D_DESC {
             Width: width,
             Height: height,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Format: DXGI_FORMAT_R8_UNORM,
             MipLevels: 1,
             ArraySize: 1,
             SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
             },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+
+        let mut target = None;
+        unsafe { device.CreateTexture2D(&target_desc, None, Some(&mut target))? };
+        let target = target.ok_or_else(crate::dx::missing_object)?;
+        let mut target_rtv = None;
+        unsafe { device.CreateRenderTargetView(&target, None, Some(&mut target_rtv))? };
+        let target_rtv = target_rtv.ok_or_else(crate::dx::missing_object)?;
+
+        let staging_desc = D3D11_TEXTURE2D_DESC {
             Usage: D3D11_USAGE_STAGING,
             BindFlags: 0,
             CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-            MiscFlags: 0,
+            ..target_desc
         };
 
         let mut slots = Vec::with_capacity(READBACK_BUFFER_COUNT);
         for _ in 0..READBACK_BUFFER_COUNT {
             let mut texture = None;
-            unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture))? };
+            unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut texture))? };
             let texture = texture.ok_or_else(crate::dx::missing_object)?;
             let resource = texture.cast()?;
             slots.push(ReadbackSlot { texture, resource });
         }
 
         Ok(Self {
+            target_rtv,
             slots,
             pending: VecDeque::with_capacity(READBACK_BUFFER_COUNT),
             next_write: 0,
@@ -60,19 +77,38 @@ impl AlphaReadback {
         })
     }
 
-    pub fn enqueue_copy(
+    pub fn enqueue_extract(
         &mut self,
         context: &ID3D11DeviceContext,
-        source: &ID3D11Texture2D,
+        pipeline: &crate::dx::pipeline::Pipeline,
+        source: &ID3D11ShaderResourceView,
     ) -> windows::core::Result<bool> {
         if self.pending.len() == self.slots.len() {
             return Ok(false);
         }
 
-        let source: ID3D11Resource = source.cast()?;
         let index = self.next_write;
         unsafe {
-            context.CopyResource(&self.slots[index].resource, &source);
+            context.OMSetRenderTargets(Some(&[Some(self.target_rtv.clone())]), None);
+            context.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: self.width as f32,
+                Height: self.height as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            }]));
+            context.RSSetState(&pipeline.raster_state);
+            context.VSSetShader(&pipeline.vs, None);
+            context.PSSetShader(&pipeline.alpha_ps, None);
+            context.PSSetShaderResources(0, Some(&[Some(source.clone())]));
+            context.PSSetSamplers(0, Some(&[Some(pipeline.sampler.clone())]));
+            context.IASetInputLayout(None);
+            context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            context.Draw(3, 0);
+
+            let target: ID3D11Resource = self.target_rtv.GetResource()?;
+            context.CopyResource(&self.slots[index].resource, &target);
         }
         self.pending.push_back(index);
         self.next_write = (index + 1) % self.slots.len();
@@ -106,7 +142,6 @@ impl AlphaReadback {
             return Err(error);
         }
 
-        alpha.clear();
         let Some(pixel_count) = (self.width as usize).checked_mul(self.height as usize) else {
             unsafe { context.Unmap(&self.slots[index].texture, 0) };
             self.pending.pop_front();
@@ -119,8 +154,8 @@ impl AlphaReadback {
         let row_width = self.width as usize;
         for (y, output_row) in alpha.chunks_exact_mut(row_width).enumerate() {
             let source_row = unsafe { source.add(y * pitch) };
-            for (x, output_alpha) in output_row.iter_mut().enumerate() {
-                *output_alpha = unsafe { *source_row.add(x * 4 + 3) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(source_row, output_row.as_mut_ptr(), row_width);
             }
         }
 

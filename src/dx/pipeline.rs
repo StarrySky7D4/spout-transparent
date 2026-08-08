@@ -24,6 +24,14 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 }
 "#;
 
+const ALPHA_PS_SRC: &str = r#"
+Texture2D tex : register(t0);
+SamplerState sam : register(s0);
+float main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
+    return tex.Sample(sam, uv).a;
+}
+"#;
+
 const D3DCOMPILE_DEBUG: u32 = 0x1;
 const D3DCOMPILE_SKIP_OPTIMIZATION: u32 = 0x2000;
 
@@ -38,6 +46,7 @@ fn compile_flags() -> u32 {
 pub struct Pipeline {
     pub vs: ID3D11VertexShader,
     pub ps: ID3D11PixelShader,
+    pub alpha_ps: ID3D11PixelShader,
     pub sampler: ID3D11SamplerState,
     pub raster_state: ID3D11RasterizerState,
 }
@@ -80,6 +89,7 @@ fn compile_shader(code: &str, target: &str) -> windows::core::Result<Vec<u8>> {
 pub fn create_pipeline(device: &ID3D11Device) -> windows::core::Result<Pipeline> {
     let vs_blob = compile_shader(VS_SRC, "vs_5_0")?;
     let ps_blob = compile_shader(PS_SRC, "ps_5_0")?;
+    let alpha_ps_blob = compile_shader(ALPHA_PS_SRC, "ps_5_0")?;
 
     let mut vs = None;
     unsafe {
@@ -88,6 +98,10 @@ pub fn create_pipeline(device: &ID3D11Device) -> windows::core::Result<Pipeline>
     let mut ps = None;
     unsafe {
         device.CreatePixelShader(&ps_blob, None, Some(&mut ps))?;
+    }
+    let mut alpha_ps = None;
+    unsafe {
+        device.CreatePixelShader(&alpha_ps_blob, None, Some(&mut alpha_ps))?;
     }
 
     let sampler_desc = D3D11_SAMPLER_DESC {
@@ -123,6 +137,7 @@ pub fn create_pipeline(device: &ID3D11Device) -> windows::core::Result<Pipeline>
     Ok(Pipeline {
         vs: vs.ok_or_else(crate::dx::missing_object)?,
         ps: ps.ok_or_else(crate::dx::missing_object)?,
+        alpha_ps: alpha_ps.ok_or_else(crate::dx::missing_object)?,
         sampler: sampler.ok_or_else(crate::dx::missing_object)?,
         raster_state: raster_state.ok_or_else(crate::dx::missing_object)?,
     })
