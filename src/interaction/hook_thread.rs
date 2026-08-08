@@ -6,9 +6,10 @@ use std::time::Duration;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, GetWindowLongW, GetWindowRect, PeekMessageW,
-    PostThreadMessageW, SetWindowLongW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-    WindowFromPoint, GWL_EXSTYLE, MSG, PM_NOREMOVE, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WS_EX_TRANSPARENT,
+    PostMessageW, PostThreadMessageW, SetWindowLongW, SetWindowsHookExW, TranslateMessage,
+    UnhookWindowsHookEx, WindowFromPoint, GWL_EXSTYLE, MSG, PM_NOREMOVE, WH_MOUSE_LL,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WS_EX_TRANSPARENT,
 };
 
 use super::ALPHA_THRESHOLD;
@@ -407,11 +408,10 @@ pub fn handle_passthrough_event(ev: &PassthroughEvent, hwnd: HWND) {
         }
         let new_lparam = point_to_lparam(point);
         let new_wparam = forwarded_wparam(ev.msg, ev.mouse_data);
-        unsafe {
-            windows::Win32::UI::WindowsAndMessaging::SendMessageW(
-                below, ev.msg, new_wparam, new_lparam,
-            );
-        }
+        // Mouse messages do not contain borrowed pointers, so they can be queued
+        // safely. Avoid synchronously entering an arbitrary target window's
+        // procedure from the render loop: a hung target must not freeze frames.
+        let _ = unsafe { PostMessageW(below, ev.msg, new_wparam, new_lparam) };
     }
 }
 
