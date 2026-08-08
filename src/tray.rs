@@ -1,19 +1,22 @@
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::sync::{mpsc, Mutex};
+use std::thread::JoinHandle;
 
 use windows::core::{w, Error, Result, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{E_FAIL, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::UI::Shell::{
     DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass, Shell_NotifyIconW, NIF_ICON,
     NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetWindowLongW, LoadIconW,
-    PostMessageW, RegisterWindowMessageW, SetForegroundWindow, SetWindowLongW, TrackPopupMenu,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow, DispatchMessageW,
+    GetCursorPos, GetMessageW, GetWindowLongW, LoadIconW, PostMessageW, PostQuitMessage,
+    RegisterWindowMessageW, SetForegroundWindow, SetWindowLongW, TrackPopupMenu, TranslateMessage,
     GWL_EXSTYLE, HMENU, IDI_APPLICATION, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
-    MF_UNCHECKED, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU,
-    WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    MF_UNCHECKED, MSG, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE,
+    WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP, WS_EX_APPWINDOW,
+    WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use crate::config::FrameRate;
@@ -43,7 +46,7 @@ const STATE_HAS_SOURCE: u32 = 1 << 5;
 static PENDING_COMMAND: AtomicU32 = AtomicU32::new(0);
 static MENU_STATE: AtomicU32 = AtomicU32::new(0);
 static TASKBAR_CREATED_MESSAGE: AtomicU32 = AtomicU32::new(0);
-static MENU_OPEN: AtomicBool = AtomicBool::new(false);
+static RENDER_HWND: AtomicIsize = AtomicIsize::new(0);
 static SOURCE_MENU: Mutex<SourceMenuState> = Mutex::new(SourceMenuState {
     names: Vec::new(),
     selected: None,
@@ -75,31 +78,41 @@ struct SourceMenuState {
 
 pub struct TrayIcon {
     hwnd: HWND,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl TrayIcon {
-    pub fn install(hwnd: HWND) -> Result<Self> {
-        hide_from_taskbar(hwnd);
+    pub fn install(render_hwnd: HWND) -> Result<Self> {
+        hide_from_taskbar(render_hwnd);
+        RENDER_HWND.store(render_hwnd.0 as isize, Ordering::Release);
 
-        let subclass_ok =
-            unsafe { SetWindowSubclass(hwnd, Some(tray_subclass), TRAY_SUBCLASS_ID, 0).as_bool() };
-        if !subclass_ok {
-            return Err(Error::from_win32());
-        }
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("spout-tray".to_string())
+            .spawn(move || run_tray_thread(ready_tx))
+            .map_err(|error| Error::new(E_FAIL, format!("Failed to start tray thread: {error}")))?;
 
-        TASKBAR_CREATED_MESSAGE.store(
-            unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
-            Ordering::Release,
-        );
-
-        if let Err(error) = add_icon(hwnd) {
-            unsafe {
-                let _ = RemoveWindowSubclass(hwnd, Some(tray_subclass), TRAY_SUBCLASS_ID);
+        let hwnd_value = match ready_rx.recv() {
+            Ok(Ok(hwnd)) => hwnd,
+            Ok(Err(message)) => {
+                let _ = worker.join();
+                RENDER_HWND.store(0, Ordering::Release);
+                return Err(Error::new(E_FAIL, message));
             }
-            return Err(error);
-        }
+            Err(error) => {
+                let _ = worker.join();
+                RENDER_HWND.store(0, Ordering::Release);
+                return Err(Error::new(
+                    E_FAIL,
+                    format!("Tray thread stopped during startup: {error}"),
+                ));
+            }
+        };
 
-        Ok(Self { hwnd })
+        Ok(Self {
+            hwnd: HWND(hwnd_value as *mut std::ffi::c_void),
+            worker: Some(worker),
+        })
     }
 
     pub fn update_state(&self, state: TrayState) {
@@ -120,13 +133,90 @@ impl TrayIcon {
 
 impl Drop for TrayIcon {
     fn drop(&mut self) {
-        let data = icon_data(self.hwnd, None);
         unsafe {
-            let _ = Shell_NotifyIconW(NIM_DELETE, &data);
-            let _ = RemoveWindowSubclass(self.hwnd, Some(tray_subclass), TRAY_SUBCLASS_ID);
+            let _ = PostMessageW(self.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
         }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        RENDER_HWND.store(0, Ordering::Release);
         PENDING_COMMAND.store(0, Ordering::Release);
     }
+}
+
+fn run_tray_thread(ready: mpsc::SyncSender<std::result::Result<isize, String>>) {
+    let setup = setup_tray_window();
+    let hwnd = match setup {
+        Ok(hwnd) => hwnd,
+        Err(error) => {
+            let _ = ready.send(Err(format!("Tray window setup failed: {error:?}")));
+            return;
+        }
+    };
+
+    if ready.send(Ok(hwnd.0 as isize)).is_err() {
+        unsafe {
+            let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+    }
+
+    let mut message = MSG::default();
+    loop {
+        let result = unsafe { GetMessageW(&mut message, None, 0, 0) }.0;
+        if result <= 0 {
+            if result < 0 {
+                log::error!("Tray message loop failed: {:?}", Error::from_win32());
+            }
+            break;
+        }
+        unsafe {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+}
+
+fn setup_tray_window() -> Result<HWND> {
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            w!("STATIC"),
+            w!("Spout Transparent Tray"),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )?
+    };
+
+    let subclass_ok =
+        unsafe { SetWindowSubclass(hwnd, Some(tray_subclass), TRAY_SUBCLASS_ID, 0).as_bool() };
+    if !subclass_ok {
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+        return Err(Error::from_win32());
+    }
+
+    TASKBAR_CREATED_MESSAGE.store(
+        unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
+        Ordering::Release,
+    );
+
+    if let Err(error) = add_icon(hwnd) {
+        unsafe {
+            let _ = RemoveWindowSubclass(hwnd, Some(tray_subclass), TRAY_SUBCLASS_ID);
+            let _ = DestroyWindow(hwnd);
+        }
+        return Err(error);
+    }
+
+    Ok(hwnd)
 }
 
 fn hide_from_taskbar(hwnd: HWND) {
@@ -186,11 +276,14 @@ unsafe extern "system" fn tray_subclass(
     if message == TRAY_CALLBACK_MESSAGE {
         match lparam.0 as u32 {
             WM_RBUTTONUP | WM_CONTEXTMENU => {
-                show_context_menu_async(hwnd);
+                if let Err(error) = show_context_menu(hwnd) {
+                    log::error!("Tray menu failed: {error:?}");
+                }
                 return LRESULT(0);
             }
             WM_LBUTTONDBLCLK => {
                 PENDING_COMMAND.store(CMD_TOGGLE_VISIBILITY, Ordering::Release);
+                wake_render_loop();
                 return LRESULT(0);
             }
             _ => {}
@@ -205,44 +298,26 @@ unsafe extern "system" fn tray_subclass(
         return LRESULT(0);
     }
 
+    if message == WM_DESTROY {
+        let data = icon_data(hwnd, None);
+        let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+        PostQuitMessage(0);
+    }
+
     DefSubclassProc(hwnd, message, wparam, lparam)
 }
 
-fn show_context_menu_async(hwnd: HWND) {
-    if MENU_OPEN
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
-    }
-
-    // TrackPopupMenu blocks until the menu closes. Run it on a dedicated thread
-    // so the winit event loop can keep polling Spout and presenting frames.
-    let hwnd_value = hwnd.0 as isize;
-    let spawn_result = std::thread::Builder::new()
-        .name("spout-tray-menu".to_string())
-        .spawn(move || {
-            let _guard = MenuOpenGuard;
-            let hwnd = HWND(hwnd_value as *mut std::ffi::c_void);
-            if let Err(error) = show_context_menu(hwnd) {
-                log::error!("Tray menu failed: {error:?}");
-            }
-            unsafe {
-                let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
-            }
-        });
-
-    if let Err(error) = spawn_result {
-        MENU_OPEN.store(false, Ordering::Release);
-        log::error!("Failed to start tray menu thread: {error}");
-    }
-}
-
-struct MenuOpenGuard;
-
-impl Drop for MenuOpenGuard {
-    fn drop(&mut self) {
-        MENU_OPEN.store(false, Ordering::Release);
+fn wake_render_loop() {
+    let hwnd = RENDER_HWND.load(Ordering::Acquire);
+    if hwnd != 0 {
+        unsafe {
+            let _ = PostMessageW(
+                HWND(hwnd as *mut std::ffi::c_void),
+                WM_NULL,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
     }
 }
 
@@ -354,7 +429,9 @@ fn show_context_menu(hwnd: HWND) -> Result<()> {
         .0 as u32;
         if command != 0 {
             PENDING_COMMAND.store(command, Ordering::Release);
+            wake_render_loop();
         }
+        let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
     }
 
     Ok(())
