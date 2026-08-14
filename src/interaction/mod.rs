@@ -319,6 +319,9 @@ impl InteractionState {
         self.enabled = !self.enabled;
         if self.enabled {
             self.next_alpha_update = Instant::now();
+            self.invalidate_alpha_mask();
+        } else {
+            self.cancel_drag();
         }
         if let Some(hook) = &self.mouse_hook {
             hook.set_enabled(self.enabled);
@@ -355,13 +358,44 @@ impl InteractionState {
         winit::dpi::PhysicalSize::new(scaled(base_w), scaled(base_h))
     }
 
+    pub fn constrain_scale(&mut self, base_w: u32, base_h: u32) {
+        let dimension_limit = |value: u32| {
+            if value == 0 {
+                MAX_SCALE
+            } else {
+                MAX_RENDER_DIMENSION as f32 / value as f32
+            }
+        };
+        let max_scale = MAX_SCALE
+            .min(dimension_limit(base_w))
+            .min(dimension_limit(base_h))
+            .max(MIN_SCALE);
+        self.scale_factor = self.scale_factor.clamp(MIN_SCALE, max_scale);
+    }
+
+    pub fn cancel_drag(&mut self) {
+        self.dragging = false;
+    }
+
+    pub fn invalidate_alpha_mask(&self) {
+        if let Some(hook) = &self.mouse_hook {
+            let _ = hook.update_mask(Vec::new(), 0, 0);
+        }
+    }
+
     pub fn handle_mouse_input(
         &mut self,
         state: ElementState,
         button: MouseButton,
         window: &Window,
     ) {
-        if !self.enabled || button != MouseButton::Left {
+        if button != MouseButton::Left {
+            return;
+        }
+        if state == ElementState::Released {
+            self.dragging = false;
+        }
+        if !self.enabled {
             return;
         }
         match state {
@@ -475,6 +509,29 @@ mod tests {
             state.scaled_size(u32::MAX, u32::MAX),
             winit::dpi::PhysicalSize::new(MAX_RENDER_DIMENSION, MAX_RENDER_DIMENSION)
         );
+    }
+
+    #[test]
+    fn scale_is_constrained_without_changing_aspect_ratio() {
+        let mut state = InteractionState::new();
+        state.scale_factor = MAX_SCALE;
+        state.constrain_scale(3840, 2160);
+
+        let size = state.scaled_size(3840, 2160);
+        assert_eq!(size.width, MAX_RENDER_DIMENSION);
+        assert_eq!(size.height, 9216);
+        assert!((state.scale_factor - (MAX_RENDER_DIMENSION as f32 / 3840.0)).abs() < 0.001);
+    }
+
+    #[test]
+    fn disabling_interaction_cancels_dragging() {
+        let mut state = InteractionState::new();
+        state.enabled = true;
+        state.dragging = true;
+        state.toggle_enabled(HWND::default());
+
+        assert!(!state.enabled);
+        assert!(!state.dragging);
     }
 
     #[test]

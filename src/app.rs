@@ -27,7 +27,7 @@ use crate::dx::pipeline::create_pipeline;
 use crate::dx::staging::AlphaReadback;
 use crate::dx::swapchain::create_swapchain;
 use crate::interaction;
-use crate::spout::{FrameCounter, NamedMutex, SenderName, SpoutReceiver};
+use crate::spout::{FrameCounter, NamedMutex, SenderDiscovery, SenderName, SpoutReceiver};
 use crate::tray::{TrayAction, TrayIcon, TrayState};
 
 struct ComGuard;
@@ -501,6 +501,8 @@ fn window_should_be_visible(source_ready: bool, visibility_requested: bool) -> b
 pub fn run() -> Result<(), String> {
     log::info!("=== Spout Transparent ===");
     let app_init = init_app()?;
+    let sender_discovery =
+        SenderDiscovery::start().map_err(|error| format!("Spout discovery: {error}"))?;
 
     #[allow(deprecated)]
     let event_loop =
@@ -617,7 +619,6 @@ pub fn run() -> Result<(), String> {
     };
     let mut available_senders = Vec::new();
     let mut menu_selected_source: Option<SenderName> = None;
-    let mut next_sender_refresh = Instant::now();
     let mut redraw_requested = true;
 
     #[allow(deprecated)]
@@ -673,6 +674,7 @@ pub fn run() -> Result<(), String> {
                     }
                     if interaction::poll_cycle_framerate() {
                         let frame_rate = rs.pacer.cycle();
+                        redraw_requested = true;
                         log::info!("Frame rate: {}", frame_rate.display_name());
                     }
 
@@ -686,6 +688,8 @@ pub fn run() -> Result<(), String> {
                                     if window_visible {
                                         redraw_requested = true;
                                         rs.pacer.request_frame();
+                                    } else {
+                                        interaction_state.cancel_drag();
                                     }
                                 }
                             }
@@ -697,14 +701,13 @@ pub fn run() -> Result<(), String> {
                             }
                             TrayAction::SetFrameRate(frame_rate) => {
                                 rs.pacer.set_rate(frame_rate);
+                                redraw_requested = true;
                                 log::info!("Frame rate: {}", frame_rate.display_name());
                             }
-                            TrayAction::SelectSource(index) => {
-                                if let Some(sender_name) = available_senders.get(index).cloned() {
-                                    log::info!("Selecting Spout sender '{sender_name}'");
-                                    rs.spout.select(sender_name);
-                                    rs.pacer.request_frame();
-                                }
+                            TrayAction::SelectSource(sender_name) => {
+                                log::info!("Selecting Spout sender '{sender_name}'");
+                                rs.spout.select(sender_name);
+                                rs.pacer.request_frame();
                             }
                             TrayAction::Quit => {
                                 interaction_state.cleanup(hwnd);
@@ -714,17 +717,14 @@ pub fn run() -> Result<(), String> {
                         }
                     }
 
-                    let now = Instant::now();
-                    if now >= next_sender_refresh {
-                        match rs.spout.sender_names() {
+                    if let Some(discovery_result) = sender_discovery.take_latest() {
+                        match discovery_result {
                             Ok(senders) => {
                                 available_senders = senders;
+                                rs.spout.update_discovered(available_senders.clone());
                                 tray_icon.update_sources(
-                                    available_senders
-                                        .iter()
-                                        .map(SenderName::display_name)
-                                        .collect(),
-                                    rs.spout.current_name().map(SenderName::display_name),
+                                    available_senders.clone(),
+                                    rs.spout.current_name().cloned(),
                                 );
                                 menu_selected_source = rs.spout.current_name().cloned();
                             }
@@ -732,7 +732,6 @@ pub fn run() -> Result<(), String> {
                                 log::warn!("Failed to refresh Spout sender list: {error}");
                             }
                         }
-                        next_sender_refresh = now + Duration::from_millis(500);
                     }
 
                     let recv = match rs.spout.poll() {
@@ -752,11 +751,8 @@ pub fn run() -> Result<(), String> {
 
                     if new_sender_name != menu_selected_source {
                         tray_icon.update_sources(
-                            available_senders
-                                .iter()
-                                .map(SenderName::display_name)
-                                .collect(),
-                            new_sender_name.as_ref().map(SenderName::display_name),
+                            available_senders.clone(),
+                            new_sender_name.clone(),
                         );
                         menu_selected_source = new_sender_name.clone();
                     }
@@ -791,6 +787,8 @@ pub fn run() -> Result<(), String> {
                                 capture_sender_texture(&device, &context, &new_sender);
                                 rs.base_width = new_sender.width;
                                 rs.base_height = new_sender.height;
+                                interaction_state.cancel_drag();
+                                interaction_state.invalidate_alpha_mask();
                                 interaction_state.scale_factor = 1.0;
                                 rs.last_scale = 1.0;
                                 unsafe {
@@ -832,6 +830,7 @@ pub fn run() -> Result<(), String> {
                             rs.pacer.request_frame();
                             log::info!("Spout sender available; showing the window");
                         } else {
+                            interaction_state.cancel_drag();
                             log::info!("No usable Spout sender; hiding the window");
                         }
                     }
@@ -849,6 +848,8 @@ pub fn run() -> Result<(), String> {
                     if let (Some(sr), Some(sn)) =
                         (rs.swapchain_res.as_mut(), rs.sender.as_mut())
                     {
+                        interaction_state
+                            .constrain_scale(rs.base_width, rs.base_height);
                         let target_size =
                             interaction_state.scaled_size(rs.base_width, rs.base_height);
 

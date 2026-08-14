@@ -20,6 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::FrameRate;
+use crate::spout::SenderName;
 
 const TRAY_ICON_ID: u32 = 1;
 const TRAY_SUBCLASS_ID: usize = 2;
@@ -51,14 +52,15 @@ static SOURCE_MENU: Mutex<SourceMenuState> = Mutex::new(SourceMenuState {
     names: Vec::new(),
     selected: None,
 });
+static PENDING_SOURCE: Mutex<Option<SenderName>> = Mutex::new(None);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TrayAction {
     ToggleVisibility,
     ToggleInteraction,
     ToggleTopmost,
     SetFrameRate(FrameRate),
-    SelectSource(usize),
+    SelectSource(SenderName),
     Quit,
 }
 
@@ -71,9 +73,10 @@ pub struct TrayState {
     pub has_source: bool,
 }
 
+#[derive(Clone)]
 struct SourceMenuState {
-    names: Vec<String>,
-    selected: Option<String>,
+    names: Vec<SenderName>,
+    selected: Option<SenderName>,
 }
 
 pub struct TrayIcon {
@@ -119,7 +122,7 @@ impl TrayIcon {
         MENU_STATE.store(encode_state(state), Ordering::Release);
     }
 
-    pub fn update_sources(&self, names: Vec<String>, selected: Option<String>) {
+    pub fn update_sources(&self, names: Vec<SenderName>, selected: Option<SenderName>) {
         if let Ok(mut menu) = SOURCE_MENU.lock() {
             menu.names = names;
             menu.selected = selected;
@@ -127,7 +130,15 @@ impl TrayIcon {
     }
 
     pub fn take_action(&self) -> Option<TrayAction> {
-        action_from_command(PENDING_COMMAND.swap(0, Ordering::AcqRel))
+        let command = PENDING_COMMAND.swap(0, Ordering::AcqRel);
+        if (CMD_SOURCE_BASE..CMD_SOURCE_BASE + MAX_SOURCE_COMMANDS as u32).contains(&command) {
+            return PENDING_SOURCE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .map(TrayAction::SelectSource);
+        }
+        action_from_command(command)
     }
 }
 
@@ -141,6 +152,9 @@ impl Drop for TrayIcon {
         }
         RENDER_HWND.store(0, Ordering::Release);
         PENDING_COMMAND.store(0, Ordering::Release);
+        *PENDING_SOURCE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 }
 
@@ -323,6 +337,10 @@ fn wake_render_loop() {
 
 fn show_context_menu(hwnd: HWND) -> Result<()> {
     let state = decode_state(MENU_STATE.load(Ordering::Acquire));
+    let sources = SOURCE_MENU
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     let menu = OwnedMenu::new()?;
     let source_menu = OwnedMenu::new()?;
     let frame_menu = OwnedMenu::new()?;
@@ -341,26 +359,24 @@ fn show_context_menu(hwnd: HWND) -> Result<()> {
             },
         )?;
 
-        if let Ok(sources) = SOURCE_MENU.lock() {
-            if sources.names.is_empty() {
+        if sources.names.is_empty() {
+            AppendMenuW(
+                source_menu.handle(),
+                MF_STRING | MF_GRAYED,
+                0,
+                w!("无可用来源"),
+            )?;
+        } else {
+            for (index, name) in sources.names.iter().take(MAX_SOURCE_COMMANDS).enumerate() {
+                let menu_name = name.display_name().replace('&', "&&");
+                let wide_name: Vec<u16> =
+                    menu_name.encode_utf16().chain(std::iter::once(0)).collect();
                 AppendMenuW(
                     source_menu.handle(),
-                    MF_STRING | MF_GRAYED,
-                    0,
-                    w!("无可用来源"),
+                    MF_STRING | checked(sources.selected.as_ref() == Some(name)),
+                    (CMD_SOURCE_BASE + index as u32) as usize,
+                    PCWSTR(wide_name.as_ptr()),
                 )?;
-            } else {
-                for (index, name) in sources.names.iter().take(MAX_SOURCE_COMMANDS).enumerate() {
-                    let menu_name = name.replace('&', "&&");
-                    let wide_name: Vec<u16> =
-                        menu_name.encode_utf16().chain(std::iter::once(0)).collect();
-                    AppendMenuW(
-                        source_menu.handle(),
-                        MF_STRING | checked(sources.selected.as_ref() == Some(name)),
-                        (CMD_SOURCE_BASE + index as u32) as usize,
-                        PCWSTR(wide_name.as_ptr()),
-                    )?;
-                }
             }
         }
         AppendMenuW(
@@ -428,6 +444,10 @@ fn show_context_menu(hwnd: HWND) -> Result<()> {
         )
         .0 as u32;
         if command != 0 {
+            let pending_source = source_for_command(&sources, command);
+            *PENDING_SOURCE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = pending_source;
             PENDING_COMMAND.store(command, Ordering::Release);
             wake_render_loop();
         }
@@ -508,16 +528,16 @@ fn action_from_command(command: u32) -> Option<TrayAction> {
         CMD_FPS_60 => Some(TrayAction::SetFrameRate(FrameRate::Fps60)),
         CMD_FPS_30 => Some(TrayAction::SetFrameRate(FrameRate::Fps30)),
         CMD_QUIT => Some(TrayAction::Quit),
-        command
-            if (CMD_SOURCE_BASE..CMD_SOURCE_BASE + MAX_SOURCE_COMMANDS as u32)
-                .contains(&command) =>
-        {
-            Some(TrayAction::SelectSource(
-                (command - CMD_SOURCE_BASE) as usize,
-            ))
-        }
         _ => None,
     }
+}
+
+fn source_for_command(sources: &SourceMenuState, command: u32) -> Option<SenderName> {
+    command
+        .checked_sub(CMD_SOURCE_BASE)
+        .filter(|index| (*index as usize) < MAX_SOURCE_COMMANDS)
+        .and_then(|index| sources.names.get(index as usize))
+        .cloned()
 }
 
 struct OwnedMenu(HMENU);
@@ -574,9 +594,17 @@ mod tests {
             Some(TrayAction::SetFrameRate(FrameRate::Fps60))
         );
         assert_eq!(action_from_command(0), None);
-        assert_eq!(
-            action_from_command(CMD_SOURCE_BASE + 3),
-            Some(TrayAction::SelectSource(3))
-        );
+        assert_eq!(action_from_command(CMD_SOURCE_BASE + 3), None);
+    }
+
+    #[test]
+    fn source_command_resolves_against_the_visible_menu_snapshot() {
+        let sources = SourceMenuState {
+            names: vec![SenderName::for_test("Alpha"), SenderName::for_test("Beta")],
+            selected: None,
+        };
+
+        let selected = source_for_command(&sources, CMD_SOURCE_BASE + 1).unwrap();
+        assert_eq!(selected.display_name(), "Beta");
     }
 }

@@ -3,6 +3,8 @@ use std::fmt;
 use std::io;
 use std::mem::{size_of, zeroed};
 use std::ptr::{self, NonNull};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
@@ -21,8 +23,10 @@ const SENDER_NAME_CAPACITY: usize = 256;
 const MAX_SENDER_LIST_BYTES: usize = SENDER_NAME_CAPACITY * 4096;
 const SHARED_TEXTURE_INFO_SIZE: usize = 280;
 const METADATA_LOCK_TIMEOUT_MS: u32 = 67;
+const REALTIME_METADATA_LOCK_TIMEOUT_MS: u32 = 0;
 const CONNECTED_METADATA_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DISCONNECTED_METADATA_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const SENDER_DISCOVERY_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct SenderName(Vec<u8>);
@@ -38,6 +42,11 @@ impl SenderName {
 
     pub fn display_name(&self) -> String {
         String::from_utf8_lossy(&self.0).into_owned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(name: &str) -> Self {
+        Self(name.as_bytes().to_vec())
     }
 
     fn with_suffix(&self, suffix: &[u8]) -> io::Result<CString> {
@@ -178,6 +187,7 @@ impl SenderInfo {
 pub struct SpoutReceiver {
     selected: Option<SenderName>,
     current: Option<SenderInfo>,
+    discovered: Vec<SenderName>,
     generation: u64,
     next_metadata_poll: Instant,
     next_discovery: Instant,
@@ -188,32 +198,15 @@ impl SpoutReceiver {
         Self {
             selected: None,
             current: None,
+            discovered: Vec::new(),
             generation: 0,
             next_metadata_poll: Instant::now(),
             next_discovery: Instant::now(),
         }
     }
 
-    pub fn sender_names(&self) -> io::Result<Vec<SenderName>> {
-        let map = match SharedMap::open(SENDER_NAMES_MAP) {
-            Ok(map) => map,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error),
-        };
-        let bytes = map.read(map.len().min(MAX_SENDER_LIST_BYTES))?;
-        let mut names = Vec::new();
-
-        for slot in bytes.chunks_exact(SENDER_NAME_CAPACITY) {
-            let Some(name) = SenderName::from_slot(slot) else {
-                break;
-            };
-            // Stale entries can survive an unclean sender shutdown. Match Spout's
-            // behavior by returning only names with a live metadata mapping.
-            if read_sender_info(&name).is_ok() {
-                names.push(name);
-            }
-        }
-        Ok(names)
+    pub fn update_discovered(&mut self, senders: Vec<SenderName>) {
+        self.discovered = senders;
     }
 
     pub fn select(&mut self, sender: SenderName) {
@@ -230,7 +223,10 @@ impl SpoutReceiver {
         }
         self.schedule_metadata_poll(now, self.current.is_some());
 
-        let result = self.selected.as_ref().map(read_sender_info);
+        let result = self
+            .selected
+            .as_ref()
+            .map(|sender| read_sender_info(sender, REALTIME_METADATA_LOCK_TIMEOUT_MS));
         match result {
             None => self.discover_sender(),
             Some(Ok(info)) if info.is_usable() => {
@@ -273,19 +269,25 @@ impl SpoutReceiver {
         }
         self.next_discovery = Instant::now() + Duration::from_millis(500);
 
-        let Some(name) = self.sender_names()?.into_iter().next() else {
-            return Ok(false);
-        };
-        let info = read_sender_info(&name)?;
-        if !info.is_usable() {
-            return Ok(false);
+        for name in self.discovered.clone() {
+            match read_sender_info(&name, REALTIME_METADATA_LOCK_TIMEOUT_MS) {
+                Ok(info) if info.is_usable() => {
+                    self.selected = Some(name);
+                    self.current = Some(info);
+                    self.generation = self.generation.wrapping_add(1);
+                    self.schedule_metadata_poll(Instant::now(), true);
+                    return Ok(true);
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::WouldBlock
+                    ) => {}
+                Err(error) => return Err(error),
+            }
         }
-
-        self.selected = Some(name);
-        self.current = Some(info);
-        self.generation = self.generation.wrapping_add(1);
-        self.schedule_metadata_poll(Instant::now(), true);
-        Ok(true)
+        Ok(false)
     }
 
     pub fn current_name(&self) -> Option<&SenderName> {
@@ -321,9 +323,88 @@ fn resource_changed(previous: &SenderInfo, current: &SenderInfo) -> bool {
         || previous.partner_id != current.partner_id
 }
 
-fn read_sender_info(sender: &SenderName) -> io::Result<SenderInfo> {
+fn read_sender_info(sender: &SenderName, timeout_ms: u32) -> io::Result<SenderInfo> {
     let map = SharedMap::open(&sender.0)?;
-    SenderInfo::parse(&map.read(SHARED_TEXTURE_INFO_SIZE)?)
+    SenderInfo::parse(&map.read(SHARED_TEXTURE_INFO_SIZE, timeout_ms)?)
+}
+
+fn discover_sender_names() -> io::Result<Vec<SenderName>> {
+    let map = match SharedMap::open(SENDER_NAMES_MAP) {
+        Ok(map) => map,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let bytes = map.read(
+        map.len().min(MAX_SENDER_LIST_BYTES),
+        METADATA_LOCK_TIMEOUT_MS,
+    )?;
+    let mut names = Vec::new();
+
+    for slot in bytes.chunks_exact(SENDER_NAME_CAPACITY) {
+        let Some(name) = SenderName::from_slot(slot) else {
+            break;
+        };
+        // A busy metadata map is still live. Only mappings that are definitely
+        // gone are filtered from the discovery snapshot.
+        match read_sender_info(&name, REALTIME_METADATA_LOCK_TIMEOUT_MS) {
+            Ok(_) => names.push(name),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => names.push(name),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => log::debug!("Could not validate Spout sender '{name}': {error}"),
+        }
+    }
+    Ok(names)
+}
+
+type DiscoveryResult = io::Result<Vec<SenderName>>;
+
+pub struct SenderDiscovery {
+    latest: Arc<Mutex<Option<DiscoveryResult>>>,
+    stop_tx: mpsc::SyncSender<()>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl SenderDiscovery {
+    pub fn start() -> io::Result<Self> {
+        let latest = Arc::new(Mutex::new(None));
+        let worker_latest = Arc::clone(&latest);
+        let (stop_tx, stop_rx) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("spout-discovery".into())
+            .spawn(move || loop {
+                let result = discover_sender_names();
+                *worker_latest
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
+
+                match stop_rx.recv_timeout(SENDER_DISCOVERY_INTERVAL) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            })?;
+
+        Ok(Self {
+            latest,
+            stop_tx,
+            worker: Some(worker),
+        })
+    }
+
+    pub fn take_latest(&self) -> Option<DiscoveryResult> {
+        self.latest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+}
+
+impl Drop for SenderDiscovery {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.try_send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 struct SharedMap {
@@ -393,10 +474,10 @@ impl SharedMap {
         self.len
     }
 
-    fn read(&self, requested: usize) -> io::Result<Vec<u8>> {
+    fn read(&self, requested: usize, timeout_ms: u32) -> io::Result<Vec<u8>> {
         let _guard = self
             .mutex
-            .lock(METADATA_LOCK_TIMEOUT_MS)?
+            .lock(timeout_ms)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "Spout metadata is busy"))?;
         let len = requested.min(self.len);
         let mut bytes = vec![0; len];
