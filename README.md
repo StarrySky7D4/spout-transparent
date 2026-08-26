@@ -10,6 +10,7 @@
 
 - 自动连接当前排序后的第一个有效 Spout Sender，也可从托盘手动切换
 - Sender 重启、切换或共享纹理重建后自动重新连接
+- DWM、显卡驱动或图形设备重启后自动重建 D3D11 与 DirectComposition 资源
 - 支持普通共享纹理和 `IDXGIKeyedMutex` 纹理同步
 - DirectComposition 透明无边框窗口
 - 托盘常驻，不显示任务栏图标；右键可快速调整运行设置
@@ -148,6 +149,10 @@ cargo run --locked
 ### 找到 Sender，但无法打开共享纹理
 
 确保 Sender 与接收端运行在同一 Windows 会话，并尽量让两者使用同一块 GPU。多显卡系统中，共享纹理通常不能跨图形适配器直接打开。
+
+### DWM 或显卡驱动重启后窗口短暂消失
+
+这是图形恢复过程。程序会释放已失效的 DXGI、Direct3D 11、Swapchain 和 DirectComposition 资源，隐藏窗口并在后台重试；图形设备恢复后会自动重新连接原来的 Sender，不需要重启程序。
 
 ### 全局快捷键注册失败
 

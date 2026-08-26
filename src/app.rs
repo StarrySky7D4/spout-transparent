@@ -12,7 +12,6 @@ use windows::Win32::System::Com::{CoInitialize, CoUninitialize};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongW, SetWindowLongW, GWL_EXSTYLE, WS_EX_NOREDIRECTIONBITMAP,
 };
-use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Event, WindowEvent};
 use winit::event_loop::ControlFlow;
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -370,30 +369,122 @@ fn capture_sender_texture(
 struct AppInit {
     #[allow(dead_code)]
     com_guard: ComGuard,
-    device: ID3D11Device,
-    context: ID3D11DeviceContext,
     spout: SpoutReceiver,
-    pipeline: crate::dx::pipeline::Pipeline,
 }
 
 fn init_app() -> Result<AppInit, String> {
     let com_guard = ComGuard::init().map_err(|e| format!("COM init: {e:?}"))?;
-
-    let (device, context) = create_dx11_device_auto().map_err(|e| format!("DX11 device: {e:?}"))?;
-    log::info!("DX11 device OK");
-
     let spout = SpoutReceiver::new();
 
-    let pipeline = create_pipeline(&device).map_err(|e| format!("Pipeline: {e:?}"))?;
-    log::info!("Pipeline OK");
+    Ok(AppInit { com_guard, spout })
+}
 
-    Ok(AppInit {
-        com_guard,
-        device,
-        context,
-        spout,
-        pipeline,
-    })
+struct GraphicsResources {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    pipeline: crate::dx::pipeline::Pipeline,
+    dcomp: crate::dx::composition::DCompResources,
+}
+
+impl GraphicsResources {
+    fn new(hwnd: HWND) -> Result<Self, String> {
+        let (device, context) =
+            create_dx11_device_auto().map_err(|error| format!("DX11 device: {error:?}"))?;
+        let pipeline = create_pipeline(&device).map_err(|error| format!("Pipeline: {error:?}"))?;
+        let dxgi_device: IDXGIDevice = device
+            .cast()
+            .map_err(|error| format!("IDXGIDevice: {error:?}"))?;
+        let dcomp = crate::dx::composition::setup_dcomp(&dxgi_device, hwnd)
+            .map_err(|error| format!("DComp setup: {error:?}"))?;
+        log::info!("Graphics resources initialized");
+        Ok(Self {
+            device,
+            context,
+            pipeline,
+            dcomp,
+        })
+    }
+
+    fn prepare_for_drop(&self) {
+        self.dcomp.detach();
+        unsafe {
+            self.context.ClearState();
+            self.context.Flush();
+        }
+    }
+
+    fn device_removed_reason(&self) -> Option<windows::core::Error> {
+        unsafe { self.device.GetDeviceRemovedReason().err() }
+    }
+}
+
+const GRAPHICS_RETRY_INITIAL: Duration = Duration::from_millis(100);
+const GRAPHICS_RETRY_MAX: Duration = Duration::from_secs(2);
+
+#[derive(Debug)]
+struct GraphicsRecovery {
+    pending: bool,
+    failures: u32,
+    next_attempt: Instant,
+}
+
+impl GraphicsRecovery {
+    fn new(now: Instant) -> Self {
+        Self {
+            pending: false,
+            failures: 0,
+            next_attempt: now,
+        }
+    }
+
+    fn request(&mut self, now: Instant) {
+        if !self.pending {
+            self.pending = true;
+            self.failures = 0;
+            self.next_attempt = now;
+        }
+    }
+
+    fn should_attempt(&self, now: Instant) -> bool {
+        self.pending && now >= self.next_attempt
+    }
+
+    fn failed(&mut self, now: Instant) -> Duration {
+        self.pending = true;
+        let shift = self.failures.min(5);
+        let delay = GRAPHICS_RETRY_INITIAL
+            .checked_mul(1 << shift)
+            .unwrap_or(GRAPHICS_RETRY_MAX)
+            .min(GRAPHICS_RETRY_MAX);
+        self.failures = self.failures.saturating_add(1);
+        self.next_attempt = now + delay;
+        delay
+    }
+
+    fn succeeded(&mut self) {
+        self.pending = false;
+        self.failures = 0;
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.pending.then_some(self.next_attempt)
+    }
+}
+
+fn request_graphics_recovery(
+    recovery: &mut GraphicsRecovery,
+    graphics: &GraphicsResources,
+    phase: &str,
+    error: &windows::core::Error,
+) {
+    if let Some(reason) = graphics.device_removed_reason() {
+        log::error!(
+            "{phase} failed: {error:?}; D3D11 device-removed reason: {reason:?}; scheduling full graphics recovery"
+        );
+    } else {
+        log::error!("{phase} failed: {error:?}; scheduling full graphics recovery");
+    }
+    recovery.request(Instant::now());
 }
 
 fn render_frame(
@@ -463,10 +554,11 @@ fn update_alpha(
 }
 
 struct RenderState {
+    #[allow(dead_code)]
+    com_guard: ComGuard,
     spout: SpoutReceiver,
     sender: Option<SenderResources>,
     swapchain_res: Option<SwapchainResources>,
-    pipeline: crate::dx::pipeline::Pipeline,
     frame_count: u64,
     last_fail_time: Instant,
     #[cfg(debug_assertions)]
@@ -479,6 +571,20 @@ struct RenderState {
     last_scale: f32,
     alpha_buf: Vec<u8>,
     pacer: FramePacer,
+}
+
+impl RenderState {
+    fn invalidate_graphics(&mut self) {
+        self.sender = None;
+        self.swapchain_res = None;
+        self.current_handle = std::ptr::null_mut();
+        self.alpha_buf.clear();
+        self.last_fail_time = Instant::now() - Duration::from_secs(1);
+        #[cfg(debug_assertions)]
+        {
+            self.first_render_logged = false;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -555,12 +661,8 @@ pub fn run() -> Result<(), String> {
     interaction::install_hotkey_subclass(hwnd).map_err(|e| format!("Hotkey subclass: {e}"))?;
     log::info!("Hotkeys OK");
 
-    let dxgi_device: IDXGIDevice = app_init
-        .device
-        .cast()
-        .map_err(|e| format!("IDXGIDevice: {e:?}"))?;
-    let dcomp = crate::dx::composition::setup_dcomp(&dxgi_device, hwnd)
-        .map_err(|e| format!("DComp setup: {e:?}"))?;
+    let mut graphics = Some(GraphicsResources::new(hwnd)?);
+    let mut graphics_recovery = GraphicsRecovery::new(Instant::now());
 
     #[cfg(debug_assertions)]
     {
@@ -593,17 +695,11 @@ pub fn run() -> Result<(), String> {
     log::info!("No Spout sender yet; waiting in the system tray");
     log::info!("=== Entering render loop ===");
 
-    let context = app_init.context.clone();
-    let device = app_init.device.clone();
-    let dcomp_device = dcomp.device.clone();
-    let root_visual = dcomp.root_visual.clone();
-    let scale_transform = dcomp.scale_transform.clone();
-
     let mut rs = RenderState {
+        com_guard: app_init.com_guard,
         spout: app_init.spout,
         sender: None,
         swapchain_res: None,
-        pipeline: app_init.pipeline,
         frame_count: 0,
         last_fail_time: Instant::now() - Duration::from_secs(1),
         #[cfg(debug_assertions)]
@@ -654,11 +750,65 @@ pub fn run() -> Result<(), String> {
                     WindowEvent::CursorMoved { position, .. } => {
                         interaction_state.handle_cursor_moved(position, &window);
                     }
+                    WindowEvent::RedrawRequested => {
+                        let state = graphics
+                            .as_ref()
+                            .map(|resources| resources.dcomp.is_valid());
+                        match state {
+                            Some(Ok(true)) | None => {}
+                            Some(Ok(false)) => {
+                                log::warn!(
+                                    "DirectComposition device became invalid; scheduling graphics recovery"
+                                );
+                                graphics_recovery.request(Instant::now());
+                            }
+                            Some(Err(error)) => {
+                                log::warn!(
+                                    "DirectComposition device-state check failed: {error:?}; scheduling graphics recovery"
+                                );
+                                graphics_recovery.request(Instant::now());
+                            }
+                        }
+                    }
                     _ => {}
                 },
                 Event::AboutToWait => {
                     for ev in interaction_state.poll_hook_events() {
                         interaction::handle_passthrough_event(&ev, hwnd);
+                    }
+
+                    let recovery_now = Instant::now();
+                    if graphics_recovery.pending && graphics.is_some() {
+                        log::warn!("Releasing invalid graphics resources");
+                        rs.invalidate_graphics();
+                        interaction_state.cancel_drag();
+                        interaction_state.invalidate_alpha_mask();
+                        if let Some(old_graphics) = graphics.take() {
+                            old_graphics.prepare_for_drop();
+                        }
+                        source_available = false;
+                        window_visible = false;
+                        window.set_visible(false);
+                        redraw_requested = true;
+                    }
+
+                    if graphics_recovery.should_attempt(recovery_now) {
+                        match GraphicsResources::new(hwnd) {
+                            Ok(new_graphics) => {
+                                graphics = Some(new_graphics);
+                                graphics_recovery.succeeded();
+                                redraw_requested = true;
+                                rs.pacer.request_frame();
+                                log::info!("Graphics recovery completed; reconnecting the sender");
+                            }
+                            Err(error) => {
+                                let delay = graphics_recovery.failed(recovery_now);
+                                log::warn!(
+                                    "Graphics recovery attempt failed: {error}; retrying in {} ms",
+                                    delay.as_millis()
+                                );
+                            }
+                        }
                     }
 
                     if interaction::poll_quit() {
@@ -765,52 +915,95 @@ pub fn run() -> Result<(), String> {
                     }
 
                     let sender_changed = new_sender_name != rs.current_sender_name;
-                    if handle_ok
+                    let sender_needs_rebuild = handle_ok
                         && cooldown
                         && (new_handle != rs.current_handle
                             || sender_changed
-                            || new_sender_generation != rs.current_sender_generation)
-                    {
-                        log::info!("[Frame {}] Sender resource changed, rebuilding...", rs.frame_count);
-                        let Some(sender_name) = new_sender_name.as_ref() else {
-                            return;
-                        };
-                        let replacement = SenderResources::open(&device, new_handle, sender_name)
+                            || new_sender_generation != rs.current_sender_generation);
+                    if sender_needs_rebuild {
+                        if let Some(graphics_resources) = graphics.as_ref() {
+                            log::info!("[Frame {}] Sender resource changed, rebuilding...", rs.frame_count);
+                            let Some(sender_name) = new_sender_name.as_ref() else {
+                                return;
+                            };
+                            let replacement = SenderResources::open(
+                                &graphics_resources.device,
+                                new_handle,
+                                sender_name,
+                            )
                             .and_then(|sender| {
-                                SwapchainResources::new(&device, sender.width, sender.height)
-                                    .map(|swapchain| (sender, swapchain))
-                                    .map_err(|error| format!("Swapchain: {error:?}"))
+                                SwapchainResources::new(
+                                    &graphics_resources.device,
+                                    sender.width,
+                                    sender.height,
+                                )
+                                .map(|swapchain| (sender, swapchain))
+                                .map_err(|error| format!("Swapchain: {error:?}"))
                             });
-                        match replacement {
-                            Ok((new_sender, sr)) => {
-                                #[cfg(debug_assertions)]
-                                capture_sender_texture(&device, &context, &new_sender);
-                                rs.base_width = new_sender.width;
-                                rs.base_height = new_sender.height;
-                                interaction_state.cancel_drag();
-                                interaction_state.invalidate_alpha_mask();
-                                interaction_state.scale_factor = 1.0;
-                                rs.last_scale = 1.0;
-                                unsafe {
-                                    let _ = scale_transform.SetScaleX2(1.0);
-                                    let _ = scale_transform.SetScaleY2(1.0);
-                                    let _ = root_visual.SetContent(&sr.swapchain);
-                                    let _ = dcomp_device.Commit();
+                            match replacement {
+                                Ok((new_sender, sr)) => {
+                                    #[cfg(debug_assertions)]
+                                capture_sender_texture(
+                                    &graphics_resources.device,
+                                    &graphics_resources.context,
+                                    &new_sender,
+                                );
+                                if sender_changed {
+                                    interaction_state.scale_factor = 1.0;
                                 }
-                                let _ = window
-                                    .request_inner_size(PhysicalSize::new(sr.width, sr.height));
-                                rs.swapchain_res = Some(sr);
-                                rs.sender = Some(new_sender);
-                                rs.current_handle = new_handle;
-                                rs.current_sender_name = Some(sender_name.clone());
-                                rs.current_sender_generation = new_sender_generation;
-                                redraw_requested = true;
-                                rs.pacer.request_frame();
-                                log::info!("[Frame {}] Texture rebuild complete", rs.frame_count);
-                            }
-                            Err(error) => {
-                                log::error!("Rebuild failed: {error}");
-                                rs.last_fail_time = Instant::now();
+                                interaction_state
+                                    .constrain_scale(new_sender.width, new_sender.height);
+                                let restored_scale = interaction_state.scale_factor;
+                                match graphics_resources
+                                    .dcomp
+                                    .attach_swapchain(&sr.swapchain, restored_scale)
+                                {
+                                    Ok(()) => {
+                                            rs.base_width = new_sender.width;
+                                            rs.base_height = new_sender.height;
+                                        interaction_state.cancel_drag();
+                                        interaction_state.invalidate_alpha_mask();
+                                        rs.last_scale = restored_scale;
+                                        let _ = window.request_inner_size(
+                                            interaction_state
+                                                .scaled_size(sr.width, sr.height),
+                                        );
+                                            rs.swapchain_res = Some(sr);
+                                            rs.sender = Some(new_sender);
+                                            rs.current_handle = new_handle;
+                                            rs.current_sender_name = Some(sender_name.clone());
+                                            rs.current_sender_generation = new_sender_generation;
+                                            redraw_requested = true;
+                                            rs.pacer.request_frame();
+                                            log::info!(
+                                                "[Frame {}] Texture rebuild complete",
+                                                rs.frame_count
+                                            );
+                                        }
+                                        Err(error) => {
+                                            request_graphics_recovery(
+                                                &mut graphics_recovery,
+                                                graphics_resources,
+                                                "DirectComposition swapchain attachment",
+                                                &error,
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    log::error!("Rebuild failed: {error}");
+                                    if let Some(reason) =
+                                        graphics_resources.device_removed_reason()
+                                    {
+                                        request_graphics_recovery(
+                                            &mut graphics_recovery,
+                                            graphics_resources,
+                                            "Sender resource rebuild",
+                                            &reason,
+                                        );
+                                    }
+                                    rs.last_fail_time = Instant::now();
+                                }
                             }
                         }
                     }
@@ -845,8 +1038,11 @@ pub fn run() -> Result<(), String> {
 
                     let mut frame_update = FrameUpdate::Unchanged;
 
-                    if let (Some(sr), Some(sn)) =
-                        (rs.swapchain_res.as_mut(), rs.sender.as_mut())
+                    if let (Some(graphics_resources), Some(sr), Some(sn)) = (
+                        graphics.as_ref(),
+                        rs.swapchain_res.as_mut(),
+                        rs.sender.as_mut(),
+                    )
                     {
                         interaction_state
                             .constrain_scale(rs.base_width, rs.base_height);
@@ -857,16 +1053,14 @@ pub fn run() -> Result<(), String> {
                             (rs.last_scale - interaction_state.scale_factor).abs() > f32::EPSILON;
                         if scale_changed {
                             let scale = interaction_state.scale_factor;
-                            let transform_result = unsafe {
-                                scale_transform
-                                    .SetScaleX2(scale)
-                                    .and_then(|_| scale_transform.SetScaleY2(scale))
-                                    .and_then(|_| dcomp_device.Commit())
-                            };
+                            let transform_result = graphics_resources.dcomp.set_scale(scale);
                             if let Err(error) = transform_result {
                                 interaction_state.scale_factor = rs.last_scale;
-                                log::warn!(
-                                    "DirectComposition scale to {scale:.3} failed; keeping the previous scale: {error:?}"
+                                request_graphics_recovery(
+                                    &mut graphics_recovery,
+                                    graphics_resources,
+                                    "DirectComposition scale commit",
+                                    &error,
                                 );
                             } else {
                                 rs.last_scale = interaction_state.scale_factor;
@@ -874,21 +1068,32 @@ pub fn run() -> Result<(), String> {
                             }
                         }
 
-                        match sr.set_alpha_enabled(&device, interaction_state.enabled) {
+                        match sr.set_alpha_enabled(
+                            &graphics_resources.device,
+                            interaction_state.enabled,
+                        ) {
                             Ok(true) => {
                                 redraw_requested = true;
                                 rs.pacer.request_frame();
                             }
                             Ok(false) => {}
                             Err(error) => {
-                                log::warn!("Could not create Alpha R8 readback resources: {error:?}")
+                                log::warn!("Could not create Alpha R8 readback resources: {error:?}");
+                                if let Some(reason) = graphics_resources.device_removed_reason() {
+                                    request_graphics_recovery(
+                                        &mut graphics_recovery,
+                                        graphics_resources,
+                                        "Alpha readback resource creation",
+                                        &reason,
+                                    );
+                                }
                             }
                         }
                         if interaction_state.enabled {
                             update_alpha(
-                                &context,
+                                &graphics_resources.context,
                                 sr,
-                                &rs.pipeline,
+                                &graphics_resources.pipeline,
                                 &sn.srv,
                                 &mut interaction_state,
                                 &mut rs.alpha_buf,
@@ -918,8 +1123,8 @@ pub fn run() -> Result<(), String> {
                                     .is_none_or(FrameCounter::is_new_frame);
                                 if redraw_requested || sender_has_new_frame {
                                     render_frame(
-                                        &context,
-                                        &rs.pipeline,
+                                        &graphics_resources.context,
+                                        &graphics_resources.pipeline,
                                         &sn.srv,
                                         &sr.rtv,
                                         sr.width,
@@ -940,10 +1145,13 @@ pub fn run() -> Result<(), String> {
                                                 .and_then(|p| p.parent().map(|p| p.to_path_buf()))
                                                 .unwrap_or_default();
                                             save_texture_to_bmp(
-                                                &device, &context, &bb, "BackBuffer",
+                                                &graphics_resources.device,
+                                                &graphics_resources.context,
+                                                &bb,
+                                                "BackBuffer",
                                                 &exe_dir.join("debug_02_backbuffer_after_draw.bmp"),
                                             );
-                                            sample_pixel(&device, &context, &bb,
+                                            sample_pixel(&graphics_resources.device, &graphics_resources.context, &bb,
                                                          sr.width / 2, sr.height / 2, "BB center");
                                         }
                                     }
@@ -963,9 +1171,9 @@ pub fn run() -> Result<(), String> {
                                         let schedule_extract = interaction_state
                                             .should_update_alpha(Instant::now());
                                         update_alpha(
-                                            &context,
+                                            &graphics_resources.context,
                                             sr,
-                                            &rs.pipeline,
+                                            &graphics_resources.pipeline,
                                             &sn.srv,
                                             &mut interaction_state,
                                             &mut rs.alpha_buf,
@@ -979,24 +1187,36 @@ pub fn run() -> Result<(), String> {
                         }
                     }
 
-                    let presented_frame = frame_update.needs_present();
-                    if presented_frame {
-                        let Some(sr) = rs.swapchain_res.as_ref() else {
-                            return;
-                        };
-                        let present_result = unsafe { sr.swapchain.Present(1, DXGI_PRESENT(0)) };
-                        if present_result.is_err() {
-                            log::error!("Swapchain Present failed: {present_result:?}");
-                            interaction_state.cleanup(hwnd);
-                            elwt.exit();
-                            return;
+                    let mut presented_frame = false;
+                    if frame_update.needs_present() {
+                        if let (Some(graphics_resources), Some(sr)) =
+                            (graphics.as_ref(), rs.swapchain_res.as_ref())
+                        {
+                            match unsafe { sr.swapchain.Present(1, DXGI_PRESENT(0)) }.ok() {
+                                Ok(()) => {
+                                    rs.pacer.presented(Instant::now());
+                                    presented_frame = true;
+                                }
+                                Err(error) => {
+                                    redraw_requested = true;
+                                    request_graphics_recovery(
+                                        &mut graphics_recovery,
+                                        graphics_resources,
+                                        "Swapchain Present",
+                                        &error,
+                                    );
+                                }
+                            }
                         }
-                        rs.pacer.presented(Instant::now());
                     }
 
-                    let next_wake = rs
-                        .pacer
-                        .next_wake(Instant::now(), handle_ok && window_visible, presented_frame);
+                    let next_wake = graphics_recovery.deadline().or_else(|| {
+                        rs.pacer.next_wake(
+                            Instant::now(),
+                            handle_ok && window_visible,
+                            presented_frame,
+                        )
+                    });
                     if let Some(deadline) = next_wake {
                         elwt.set_control_flow(ControlFlow::WaitUntil(deadline));
                     } else {
@@ -1013,7 +1233,9 @@ pub fn run() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{window_should_be_visible, FrameUpdate};
+    use std::time::{Duration, Instant};
+
+    use super::{window_should_be_visible, FrameUpdate, GraphicsRecovery};
 
     #[test]
     fn unchanged_backbuffer_is_not_presented() {
@@ -1026,5 +1248,46 @@ mod tests {
         assert!(!window_should_be_visible(false, true));
         assert!(window_should_be_visible(true, true));
         assert!(!window_should_be_visible(true, false));
+    }
+
+    #[test]
+    fn graphics_recovery_retries_with_bounded_backoff() {
+        let start = Instant::now();
+        let mut recovery = GraphicsRecovery::new(start);
+        assert!(!recovery.should_attempt(start));
+
+        recovery.request(start);
+        assert!(recovery.should_attempt(start));
+
+        let first_delay = recovery.failed(start);
+        assert_eq!(first_delay, Duration::from_millis(100));
+        assert!(!recovery.should_attempt(start + Duration::from_millis(99)));
+        assert!(recovery.should_attempt(start + first_delay));
+
+        let second_delay = recovery.failed(start + first_delay);
+        assert_eq!(second_delay, Duration::from_millis(200));
+
+        let mut now = start + first_delay + second_delay;
+        let mut last_delay = second_delay;
+        for _ in 0..8 {
+            last_delay = recovery.failed(now);
+            now += last_delay;
+        }
+        assert_eq!(last_delay, Duration::from_secs(2));
+
+        recovery.succeeded();
+        assert!(recovery.deadline().is_none());
+    }
+
+    #[test]
+    fn duplicate_recovery_request_does_not_reset_retry_deadline() {
+        let start = Instant::now();
+        let mut recovery = GraphicsRecovery::new(start);
+        recovery.request(start);
+        let delay = recovery.failed(start);
+        let deadline = recovery.deadline();
+
+        recovery.request(start + delay / 2);
+        assert_eq!(recovery.deadline(), deadline);
     }
 }

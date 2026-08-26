@@ -3,14 +3,47 @@ use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionScaleTransform,
     IDCompositionTarget, IDCompositionVisual,
 };
-use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGISwapChain1};
 
 pub struct DCompResources {
     pub device: IDCompositionDevice,
-    #[allow(dead_code)]
     pub target: IDCompositionTarget,
     pub root_visual: IDCompositionVisual,
     pub scale_transform: IDCompositionScaleTransform,
+}
+
+impl DCompResources {
+    pub fn is_valid(&self) -> windows::core::Result<bool> {
+        unsafe { self.device.CheckDeviceState().map(|valid| valid.as_bool()) }
+    }
+
+    pub fn attach_swapchain(
+        &self,
+        swapchain: &IDXGISwapChain1,
+        scale: f32,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            self.scale_transform.SetScaleX2(scale)?;
+            self.scale_transform.SetScaleY2(scale)?;
+            self.root_visual.SetContent(swapchain)?;
+            self.device.Commit()
+        }
+    }
+
+    pub fn set_scale(&self, scale: f32) -> windows::core::Result<()> {
+        unsafe {
+            self.scale_transform.SetScaleX2(scale)?;
+            self.scale_transform.SetScaleY2(scale)?;
+            self.device.Commit()
+        }
+    }
+
+    pub fn detach(&self) {
+        unsafe {
+            let _ = self.target.SetRoot(None::<&IDCompositionVisual>);
+            let _ = self.device.Commit();
+        }
+    }
 }
 
 pub fn setup_dcomp(dxgi_device: &IDXGIDevice, hwnd: HWND) -> windows::core::Result<DCompResources> {
