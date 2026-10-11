@@ -13,15 +13,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::ALPHA_THRESHOLD;
-
-pub struct PassthroughEvent {
-    pub msg: u32,
-    pub mouse_data: u32,
-    pub screen_pt: POINT,
-}
+use crate::crop::CropLayout;
+use crate::events::{AppEvent, EventSender, PassthroughEvent};
 
 enum HookCommand {
     SetEnabled(bool),
+    SetLayout(CropLayout),
     Shutdown,
 }
 
@@ -53,20 +50,19 @@ struct HookThreadState {
     mask_width: u32,
     mask_height: u32,
     enabled: bool,
-    evt_tx: Sender<PassthroughEvent>,
+    layout: Option<CropLayout>,
+    events: Option<EventSender>,
 }
 
 pub struct MouseHook {
     cmd_tx: Sender<HookCommand>,
     mask_mailbox: Arc<Mutex<MaskMailbox>>,
     thread_handle: Option<JoinHandle<()>>,
-    evt_rx: Receiver<PassthroughEvent>,
 }
 
 impl MouseHook {
-    pub fn install(hwnd: HWND) -> Result<Self, String> {
+    pub fn install(hwnd: HWND, events: EventSender) -> Result<Self, String> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<HookCommand>();
-        let (evt_tx, evt_rx) = mpsc::channel::<PassthroughEvent>();
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
         let mask_mailbox = Arc::new(Mutex::new(MaskMailbox::default()));
 
@@ -78,7 +74,7 @@ impl MouseHook {
             .name("mouse_hook".into())
             .spawn(move || {
                 let hwnd = HWND(hwnd_raw as *mut _);
-                hook_thread_entry(hwnd, cmd_rx, evt_tx, ready_tx, thread_mask_mailbox);
+                hook_thread_entry(hwnd, cmd_rx, events, ready_tx, thread_mask_mailbox);
             })
             .map_err(|e| format!("Failed to spawn hook thread: {e}"))?;
 
@@ -103,7 +99,6 @@ impl MouseHook {
             cmd_tx,
             mask_mailbox,
             thread_handle: Some(handle),
-            evt_rx,
         })
     }
 
@@ -129,8 +124,10 @@ impl MouseHook {
         }
     }
 
-    pub fn poll_events(&self) -> impl Iterator<Item = PassthroughEvent> + '_ {
-        std::iter::from_fn(|| self.evt_rx.try_recv().ok())
+    pub fn set_layout(&self, layout: CropLayout) {
+        if self.cmd_tx.send(HookCommand::SetLayout(layout)).is_ok() {
+            wake_hook_thread();
+        }
     }
 
     pub fn uninstall(&mut self) {
@@ -153,7 +150,7 @@ impl Drop for MouseHook {
 fn hook_thread_entry(
     hwnd: HWND,
     cmd_rx: Receiver<HookCommand>,
-    evt_tx: Sender<PassthroughEvent>,
+    events: EventSender,
     ready_tx: mpsc::SyncSender<Result<(), String>>,
     mask_mailbox: Arc<Mutex<MaskMailbox>>,
 ) {
@@ -168,7 +165,8 @@ fn hook_thread_entry(
         mask_width: 0,
         mask_height: 0,
         enabled: false,
-        evt_tx,
+        layout: None,
+        events: Some(events),
     };
 
     let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(hook_callback), None, 0) };
@@ -208,7 +206,16 @@ fn hook_thread_entry(
             match cmd {
                 HookCommand::SetEnabled(e) => {
                     state.enabled = e;
+                    if !e {
+                        state.mask_alpha = Vec::new();
+                        state.mask_width = 0;
+                        state.mask_height = 0;
+                        let mut mailbox = lock_mailbox(&mask_mailbox);
+                        mailbox.pending = None;
+                        mailbox.recycled = None;
+                    }
                 }
+                HookCommand::SetLayout(layout) => state.layout = Some(layout),
                 HookCommand::Shutdown => {
                     unsafe {
                         let _ = UnhookWindowsHookEx(hook);
@@ -329,8 +336,8 @@ unsafe extern "system" fn hook_callback(code: i32, wparam: WPARAM, lparam: LPARA
 
     let Some(alpha) = sample_scaled_alpha(
         &state.mask_alpha,
-        state.mask_width,
-        state.mask_height,
+        (state.mask_width, state.mask_height),
+        state.layout,
         win_w,
         win_h,
         cx as u32,
@@ -341,12 +348,18 @@ unsafe extern "system" fn hook_callback(code: i32, wparam: WPARAM, lparam: LPARA
     let is_transparent = alpha < ALPHA_THRESHOLD as f32;
 
     if is_transparent {
-        let _ = state.evt_tx.send(PassthroughEvent {
+        let event = PassthroughEvent {
             msg,
             mouse_data: hook_data.mouseData,
             screen_pt,
-        });
-        return LRESULT(1);
+        };
+        if state
+            .events
+            .as_ref()
+            .is_some_and(|events| events.send_event(AppEvent::Mouse(event)).is_ok())
+        {
+            return LRESULT(1);
+        }
     }
 
     CallNextHookEx(None, code, wparam, lparam)
@@ -354,13 +367,14 @@ unsafe extern "system" fn hook_callback(code: i32, wparam: WPARAM, lparam: LPARA
 
 fn sample_scaled_alpha(
     alpha: &[u8],
-    source_width: u32,
-    source_height: u32,
+    source_size: (u32, u32),
+    layout: Option<CropLayout>,
     window_width: u32,
     window_height: u32,
     window_x: u32,
     window_y: u32,
 ) -> Option<f32> {
+    let (source_width, source_height) = source_size;
     let expected_len = (source_width as usize).checked_mul(source_height as usize)?;
     if source_width == 0
         || source_height == 0
@@ -374,10 +388,24 @@ fn sample_scaled_alpha(
     }
 
     // Match normalized-coordinate linear texture sampling used by the render path.
-    let source_x = ((window_x as f32 + 0.5) * source_width as f32 / window_width as f32 - 0.5)
-        .clamp(0.0, source_width.saturating_sub(1) as f32);
-    let source_y = ((window_y as f32 + 0.5) * source_height as f32 / window_height as f32 - 0.5)
-        .clamp(0.0, source_height.saturating_sub(1) as f32);
+    let (source_x, source_y) = layout.map_or_else(
+        || {
+            (
+                (window_x as f32 + 0.5) * source_width as f32 / window_width as f32 - 0.5,
+                (window_y as f32 + 0.5) * source_height as f32 / window_height as f32 - 0.5,
+            )
+        },
+        |layout| layout.source_point(window_x, window_y),
+    );
+    if source_x < -0.5
+        || source_y < -0.5
+        || source_x >= source_width as f32 - 0.5
+        || source_y >= source_height as f32 - 0.5
+    {
+        return Some(0.0);
+    }
+    let source_x = source_x.clamp(0.0, source_width.saturating_sub(1) as f32);
+    let source_y = source_y.clamp(0.0, source_height.saturating_sub(1) as f32);
     let x0 = source_x.floor() as u32;
     let y0 = source_y.floor() as u32;
     let x1 = (x0 + 1).min(source_width - 1);
@@ -458,10 +486,44 @@ mod tests {
     #[test]
     fn scaled_alpha_uses_linear_sampling_at_edges() {
         let alpha = [0, 255];
-        assert_eq!(sample_scaled_alpha(&alpha, 2, 1, 4, 1, 0, 0), Some(0.0));
-        assert_eq!(sample_scaled_alpha(&alpha, 2, 1, 4, 1, 3, 0), Some(255.0));
-        assert_eq!(sample_scaled_alpha(&alpha, 2, 1, 4, 1, 1, 0), Some(63.75));
-        assert_eq!(sample_scaled_alpha(&alpha, 2, 1, 4, 1, 2, 0), Some(191.25));
+        assert_eq!(
+            sample_scaled_alpha(&alpha, (2, 1), None, 4, 1, 0, 0),
+            Some(0.0)
+        );
+        assert_eq!(
+            sample_scaled_alpha(&alpha, (2, 1), None, 4, 1, 3, 0),
+            Some(255.0)
+        );
+        assert_eq!(
+            sample_scaled_alpha(&alpha, (2, 1), None, 4, 1, 1, 0),
+            Some(63.75)
+        );
+        assert_eq!(
+            sample_scaled_alpha(&alpha, (2, 1), None, 4, 1, 2, 0),
+            Some(191.25)
+        );
+    }
+
+    #[test]
+    fn cropped_hit_test_samples_the_original_texture_coordinates() {
+        let alpha = [255, 0, 0, 255];
+        let layout = CropLayout::new(
+            crate::crop::CropRect {
+                x: 2,
+                y: 0,
+                width: 2,
+                height: 1,
+            },
+            2.0,
+        );
+        assert_eq!(
+            sample_scaled_alpha(&alpha, (4, 1), Some(layout), 4, 2, 0, 0),
+            Some(0.0)
+        );
+        assert_eq!(
+            sample_scaled_alpha(&alpha, (4, 1), Some(layout), 4, 2, 3, 0),
+            Some(255.0)
+        );
     }
 
     #[test]
@@ -487,7 +549,8 @@ mod tests {
             mask_width: 0,
             mask_height: 0,
             enabled: false,
-            evt_tx: mpsc::channel().0,
+            layout: None,
+            events: None,
         };
         apply_latest_mask(&mut state, &mailbox);
         assert_eq!(state.mask_alpha, [2]);

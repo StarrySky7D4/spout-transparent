@@ -1,0 +1,76 @@
+{
+  "Pid": 39968,
+  "Executable": "C:\\Users\\19825\\Desktop\\CodexProject\\spout-transparent\\target\\release\\spout-transparent.exe",
+  "Started": "2026-10-11T08:32:44.1443144+08:00",
+  "SampleSeconds": 12.5018659,
+  "CpuSeconds": 1.078125,
+  "CpuOneCorePercent": 8.623712721154687,
+  "CpuMachinePercent": 0.6159794800824777,
+  "Samples": [
+    {
+      "ElapsedSeconds": 0.9777869,
+      "WorkingSetMiB": 19.1484375,
+      "PrivateMiB": 49.65234375,
+      "Gpu3DPercent": 9.0,
+      "GpuSharedMiB": 23.234375,
+      "GpuDedicatedMiB": 0.0
+    },
+    {
+      "ElapsedSeconds": 2.6492012,
+      "WorkingSetMiB": 23.125,
+      "PrivateMiB": 50.984375,
+      "Gpu3DPercent": 11.0,
+      "GpuSharedMiB": 28.6796875,
+      "GpuDedicatedMiB": 0.0
+    },
+    {
+      "ElapsedSeconds": 4.1650998,
+      "WorkingSetMiB": 23.125,
+      "PrivateMiB": 50.984375,
+      "Gpu3DPercent": 12.0,
+      "GpuSharedMiB": 28.6796875,
+      "GpuDedicatedMiB": 0.0
+    },
+    {
+      "ElapsedSeconds": 5.6439796,
+      "WorkingSetMiB": 23.125,
+      "PrivateMiB": 50.984375,
+      "Gpu3DPercent": 12.0,
+      "GpuSharedMiB": 28.6796875,
+      "GpuDedicatedMiB": 0.0
+    },
+    {
+      "ElapsedSeconds": 7.1045389,
+      "WorkingSetMiB": 23.125,
+      "PrivateMiB": 50.984375,
+      "Gpu3DPercent": 10.0,
+      "GpuSharedMiB": 28.6796875,
+      "GpuDedicatedMiB": 0.0
+    },
+    {
+      "ElapsedSeconds": 8.5640458,
+      "WorkingSetMiB": 23.125,
+      "PrivateMiB": 50.984375,
+      "Gpu3DPercent": 11.0,
+      "GpuSharedMiB": 28.6796875,
+      "GpuDedicatedMiB": 0.0
+    },
+    {
+      "ElapsedSeconds": 10.0232724,
+      "WorkingSetMiB": 23.125,
+      "PrivateMiB": 50.984375,
+      "Gpu3DPercent": 9.0,
+      "GpuSharedMiB": 28.6796875,
+      "GpuDedicatedMiB": 0.0
+    },
+    {
+      "ElapsedSeconds": 11.4868623,
+      "WorkingSetMiB": 23.125,
+      "PrivateMiB": 50.984375,
+      "Gpu3DPercent": 9.0,
+      "GpuSharedMiB": 28.6796875,
+      "GpuDedicatedMiB": 0.0
+    }
+  ],
+  "Note": "Read-only live sampling; receiver settings and workload were not controlled; no GPU benchmark ran during this interval"
+}

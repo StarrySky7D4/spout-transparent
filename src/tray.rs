@@ -1,82 +1,37 @@
+//! Dedicated tray thread and notification-icon lifetime.
+#[path = "tray/menu.rs"]
+mod menu;
+pub use menu::TrayState;
+use std::cell::RefCell;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
-use std::sync::{mpsc, Mutex};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc;
 use std::thread::JoinHandle;
 
-use windows::core::{w, Error, Result, PCWSTR};
-use windows::Win32::Foundation::{E_FAIL, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::core::{w, Error, Result};
+use windows::Win32::Foundation::{E_FAIL, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Shell::{
     DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass, Shell_NotifyIconW, NIF_ICON,
     NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow, DispatchMessageW,
-    GetCursorPos, GetMessageW, GetWindowLongW, LoadIconW, PostMessageW, PostQuitMessage,
-    RegisterWindowMessageW, SetForegroundWindow, SetWindowLongW, TrackPopupMenu, TranslateMessage,
-    GWL_EXSTYLE, HMENU, IDI_APPLICATION, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
-    MF_UNCHECKED, MSG, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE,
-    WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP, WS_EX_APPWINDOW,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW, GetWindowLongW, LoadIconW,
+    PostMessageW, PostQuitMessage, RegisterWindowMessageW, SetWindowLongW, TranslateMessage,
+    GWL_EXSTYLE, IDI_APPLICATION, MSG, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY,
+    WM_LBUTTONDBLCLK, WM_RBUTTONUP, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
-use crate::config::FrameRate;
+pub use crate::events::AppAction as TrayAction;
+use crate::events::{AppEvent, EventSender};
 use crate::spout::SenderName;
 
 const TRAY_ICON_ID: u32 = 1;
 const TRAY_SUBCLASS_ID: usize = 2;
 const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 1;
 
-const CMD_TOGGLE_VISIBILITY: u32 = 1001;
-const CMD_TOGGLE_INTERACTION: u32 = 1002;
-const CMD_TOGGLE_TOPMOST: u32 = 1003;
-const CMD_FPS_UNLIMITED: u32 = 1010;
-const CMD_FPS_120: u32 = 1011;
-const CMD_FPS_60: u32 = 1012;
-const CMD_FPS_30: u32 = 1013;
-const CMD_QUIT: u32 = 1099;
-const CMD_SOURCE_BASE: u32 = 2000;
-const MAX_SOURCE_COMMANDS: usize = 512;
-
-const STATE_VISIBLE: u32 = 1 << 0;
-const STATE_INTERACTION: u32 = 1 << 1;
-const STATE_TOPMOST: u32 = 1 << 2;
-const STATE_RATE_SHIFT: u32 = 3;
-const STATE_RATE_MASK: u32 = 0b11 << STATE_RATE_SHIFT;
-const STATE_HAS_SOURCE: u32 = 1 << 5;
-
-static PENDING_COMMAND: AtomicU32 = AtomicU32::new(0);
-static MENU_STATE: AtomicU32 = AtomicU32::new(0);
 static TASKBAR_CREATED_MESSAGE: AtomicU32 = AtomicU32::new(0);
-static RENDER_HWND: AtomicIsize = AtomicIsize::new(0);
-static SOURCE_MENU: Mutex<SourceMenuState> = Mutex::new(SourceMenuState {
-    names: Vec::new(),
-    selected: None,
-});
-static PENDING_SOURCE: Mutex<Option<SenderName>> = Mutex::new(None);
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TrayAction {
-    ToggleVisibility,
-    ToggleInteraction,
-    ToggleTopmost,
-    SetFrameRate(FrameRate),
-    SelectSource(SenderName),
-    Quit,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct TrayState {
-    pub visible: bool,
-    pub interaction: bool,
-    pub topmost: bool,
-    pub frame_rate: FrameRate,
-    pub has_source: bool,
-}
-
-#[derive(Clone)]
-struct SourceMenuState {
-    names: Vec<SenderName>,
-    selected: Option<SenderName>,
+thread_local! {
+    static EVENT_SENDER: RefCell<Option<EventSender>> = const { RefCell::new(None) };
 }
 
 pub struct TrayIcon {
@@ -85,26 +40,23 @@ pub struct TrayIcon {
 }
 
 impl TrayIcon {
-    pub fn install(render_hwnd: HWND) -> Result<Self> {
+    pub fn install(render_hwnd: HWND, events: EventSender) -> Result<Self> {
         hide_from_taskbar(render_hwnd);
-        RENDER_HWND.store(render_hwnd.0 as isize, Ordering::Release);
 
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let worker = std::thread::Builder::new()
             .name("spout-tray".to_string())
-            .spawn(move || run_tray_thread(ready_tx))
+            .spawn(move || run_tray_thread(ready_tx, events))
             .map_err(|error| Error::new(E_FAIL, format!("Failed to start tray thread: {error}")))?;
 
         let hwnd_value = match ready_rx.recv() {
             Ok(Ok(hwnd)) => hwnd,
             Ok(Err(message)) => {
                 let _ = worker.join();
-                RENDER_HWND.store(0, Ordering::Release);
                 return Err(Error::new(E_FAIL, message));
             }
             Err(error) => {
                 let _ = worker.join();
-                RENDER_HWND.store(0, Ordering::Release);
                 return Err(Error::new(
                     E_FAIL,
                     format!("Tray thread stopped during startup: {error}"),
@@ -119,26 +71,11 @@ impl TrayIcon {
     }
 
     pub fn update_state(&self, state: TrayState) {
-        MENU_STATE.store(encode_state(state), Ordering::Release);
+        menu::update_state(state);
     }
 
     pub fn update_sources(&self, names: Vec<SenderName>, selected: Option<SenderName>) {
-        if let Ok(mut menu) = SOURCE_MENU.lock() {
-            menu.names = names;
-            menu.selected = selected;
-        }
-    }
-
-    pub fn take_action(&self) -> Option<TrayAction> {
-        let command = PENDING_COMMAND.swap(0, Ordering::AcqRel);
-        if (CMD_SOURCE_BASE..CMD_SOURCE_BASE + MAX_SOURCE_COMMANDS as u32).contains(&command) {
-            return PENDING_SOURCE
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take()
-                .map(TrayAction::SelectSource);
-        }
-        action_from_command(command)
+        menu::update_sources(names, selected);
     }
 }
 
@@ -150,15 +87,14 @@ impl Drop for TrayIcon {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-        RENDER_HWND.store(0, Ordering::Release);
-        PENDING_COMMAND.store(0, Ordering::Release);
-        *PENDING_SOURCE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 }
 
-fn run_tray_thread(ready: mpsc::SyncSender<std::result::Result<isize, String>>) {
+fn run_tray_thread(
+    ready: mpsc::SyncSender<std::result::Result<isize, String>>,
+    events: EventSender,
+) {
+    EVENT_SENDER.with(|sender| *sender.borrow_mut() = Some(events));
     let setup = setup_tray_window();
     let hwnd = match setup {
         Ok(hwnd) => hwnd,
@@ -290,14 +226,13 @@ unsafe extern "system" fn tray_subclass(
     if message == TRAY_CALLBACK_MESSAGE {
         match lparam.0 as u32 {
             WM_RBUTTONUP | WM_CONTEXTMENU => {
-                if let Err(error) = show_context_menu(hwnd) {
+                if let Err(error) = menu::show_context_menu(hwnd) {
                     log::error!("Tray menu failed: {error:?}");
                 }
                 return LRESULT(0);
             }
             WM_LBUTTONDBLCLK => {
-                PENDING_COMMAND.store(CMD_TOGGLE_VISIBILITY, Ordering::Release);
-                wake_render_loop();
+                publish_action(TrayAction::ToggleVisibility);
                 return LRESULT(0);
             }
             _ => {}
@@ -321,290 +256,10 @@ unsafe extern "system" fn tray_subclass(
     DefSubclassProc(hwnd, message, wparam, lparam)
 }
 
-fn wake_render_loop() {
-    let hwnd = RENDER_HWND.load(Ordering::Acquire);
-    if hwnd != 0 {
-        unsafe {
-            let _ = PostMessageW(
-                HWND(hwnd as *mut std::ffi::c_void),
-                WM_NULL,
-                WPARAM(0),
-                LPARAM(0),
-            );
+fn publish_action(action: TrayAction) {
+    EVENT_SENDER.with(|sender| {
+        if let Some(sender) = sender.borrow().as_ref() {
+            let _ = sender.send_event(AppEvent::Action(action));
         }
-    }
-}
-
-fn show_context_menu(hwnd: HWND) -> Result<()> {
-    let state = decode_state(MENU_STATE.load(Ordering::Acquire));
-    let sources = SOURCE_MENU
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
-    let menu = OwnedMenu::new()?;
-    let source_menu = OwnedMenu::new()?;
-    let frame_menu = OwnedMenu::new()?;
-
-    unsafe {
-        AppendMenuW(
-            menu.handle(),
-            MF_STRING | disabled(!state.has_source),
-            CMD_TOGGLE_VISIBILITY as usize,
-            if !state.has_source {
-                w!("无可用来源")
-            } else if state.visible {
-                w!("隐藏窗口")
-            } else {
-                w!("显示窗口")
-            },
-        )?;
-
-        if sources.names.is_empty() {
-            AppendMenuW(
-                source_menu.handle(),
-                MF_STRING | MF_GRAYED,
-                0,
-                w!("无可用来源"),
-            )?;
-        } else {
-            for (index, name) in sources.names.iter().take(MAX_SOURCE_COMMANDS).enumerate() {
-                let menu_name = name.display_name().replace('&', "&&");
-                let wide_name: Vec<u16> =
-                    menu_name.encode_utf16().chain(std::iter::once(0)).collect();
-                AppendMenuW(
-                    source_menu.handle(),
-                    MF_STRING | checked(sources.selected.as_ref() == Some(name)),
-                    (CMD_SOURCE_BASE + index as u32) as usize,
-                    PCWSTR(wide_name.as_ptr()),
-                )?;
-            }
-        }
-        AppendMenuW(
-            menu.handle(),
-            MF_POPUP,
-            source_menu.into_submenu(),
-            w!("来源"),
-        )?;
-        AppendMenuW(
-            menu.handle(),
-            MF_STRING | checked(state.interaction),
-            CMD_TOGGLE_INTERACTION as usize,
-            w!("交互模式"),
-        )?;
-        AppendMenuW(
-            menu.handle(),
-            MF_STRING | checked(state.topmost),
-            CMD_TOGGLE_TOPMOST as usize,
-            w!("窗口置顶"),
-        )?;
-        AppendMenuW(
-            frame_menu.handle(),
-            MF_STRING | checked(state.frame_rate == FrameRate::Unlimited),
-            CMD_FPS_UNLIMITED as usize,
-            w!("不限制"),
-        )?;
-        AppendMenuW(
-            frame_menu.handle(),
-            MF_STRING | checked(state.frame_rate == FrameRate::Fps120),
-            CMD_FPS_120 as usize,
-            w!("120 FPS"),
-        )?;
-        AppendMenuW(
-            frame_menu.handle(),
-            MF_STRING | checked(state.frame_rate == FrameRate::Fps60),
-            CMD_FPS_60 as usize,
-            w!("60 FPS"),
-        )?;
-        AppendMenuW(
-            frame_menu.handle(),
-            MF_STRING | checked(state.frame_rate == FrameRate::Fps30),
-            CMD_FPS_30 as usize,
-            w!("30 FPS"),
-        )?;
-        AppendMenuW(
-            menu.handle(),
-            MF_POPUP,
-            frame_menu.into_submenu(),
-            w!("帧率"),
-        )?;
-        AppendMenuW(menu.handle(), MF_SEPARATOR, 0, w!(""))?;
-        AppendMenuW(menu.handle(), MF_STRING, CMD_QUIT as usize, w!("退出"))?;
-
-        let mut cursor = POINT::default();
-        GetCursorPos(&mut cursor)?;
-        let _ = SetForegroundWindow(hwnd);
-        let command = TrackPopupMenu(
-            menu.handle(),
-            TPM_NONOTIFY | TPM_RETURNCMD | TPM_RIGHTBUTTON,
-            cursor.x,
-            cursor.y,
-            0,
-            hwnd,
-            None,
-        )
-        .0 as u32;
-        if command != 0 {
-            let pending_source = source_for_command(&sources, command);
-            *PENDING_SOURCE
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = pending_source;
-            PENDING_COMMAND.store(command, Ordering::Release);
-            wake_render_loop();
-        }
-        let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
-    }
-
-    Ok(())
-}
-
-fn checked(value: bool) -> windows::Win32::UI::WindowsAndMessaging::MENU_ITEM_FLAGS {
-    if value {
-        MF_CHECKED
-    } else {
-        MF_UNCHECKED
-    }
-}
-
-fn disabled(value: bool) -> windows::Win32::UI::WindowsAndMessaging::MENU_ITEM_FLAGS {
-    if value {
-        MF_GRAYED
-    } else {
-        MF_UNCHECKED
-    }
-}
-
-fn encode_state(state: TrayState) -> u32 {
-    let mut encoded = 0;
-    if state.visible {
-        encoded |= STATE_VISIBLE;
-    }
-    if state.interaction {
-        encoded |= STATE_INTERACTION;
-    }
-    if state.topmost {
-        encoded |= STATE_TOPMOST;
-    }
-    if state.has_source {
-        encoded |= STATE_HAS_SOURCE;
-    }
-    encoded | (encode_rate(state.frame_rate) << STATE_RATE_SHIFT)
-}
-
-fn decode_state(encoded: u32) -> TrayState {
-    TrayState {
-        visible: encoded & STATE_VISIBLE != 0,
-        interaction: encoded & STATE_INTERACTION != 0,
-        topmost: encoded & STATE_TOPMOST != 0,
-        frame_rate: decode_rate((encoded & STATE_RATE_MASK) >> STATE_RATE_SHIFT),
-        has_source: encoded & STATE_HAS_SOURCE != 0,
-    }
-}
-
-fn encode_rate(rate: FrameRate) -> u32 {
-    match rate {
-        FrameRate::Unlimited => 0,
-        FrameRate::Fps120 => 1,
-        FrameRate::Fps60 => 2,
-        FrameRate::Fps30 => 3,
-    }
-}
-
-fn decode_rate(rate: u32) -> FrameRate {
-    match rate {
-        1 => FrameRate::Fps120,
-        2 => FrameRate::Fps60,
-        3 => FrameRate::Fps30,
-        _ => FrameRate::Unlimited,
-    }
-}
-
-fn action_from_command(command: u32) -> Option<TrayAction> {
-    match command {
-        CMD_TOGGLE_VISIBILITY => Some(TrayAction::ToggleVisibility),
-        CMD_TOGGLE_INTERACTION => Some(TrayAction::ToggleInteraction),
-        CMD_TOGGLE_TOPMOST => Some(TrayAction::ToggleTopmost),
-        CMD_FPS_UNLIMITED => Some(TrayAction::SetFrameRate(FrameRate::Unlimited)),
-        CMD_FPS_120 => Some(TrayAction::SetFrameRate(FrameRate::Fps120)),
-        CMD_FPS_60 => Some(TrayAction::SetFrameRate(FrameRate::Fps60)),
-        CMD_FPS_30 => Some(TrayAction::SetFrameRate(FrameRate::Fps30)),
-        CMD_QUIT => Some(TrayAction::Quit),
-        _ => None,
-    }
-}
-
-fn source_for_command(sources: &SourceMenuState, command: u32) -> Option<SenderName> {
-    command
-        .checked_sub(CMD_SOURCE_BASE)
-        .filter(|index| (*index as usize) < MAX_SOURCE_COMMANDS)
-        .and_then(|index| sources.names.get(index as usize))
-        .cloned()
-}
-
-struct OwnedMenu(HMENU);
-
-impl OwnedMenu {
-    fn new() -> Result<Self> {
-        unsafe { CreatePopupMenu().map(Self) }
-    }
-
-    fn handle(&self) -> HMENU {
-        self.0
-    }
-
-    fn into_submenu(self) -> usize {
-        let handle = self.0 .0 as usize;
-        std::mem::forget(self);
-        handle
-    }
-}
-
-impl Drop for OwnedMenu {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = DestroyMenu(self.0);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tray_state_round_trips() {
-        let state = TrayState {
-            visible: false,
-            interaction: true,
-            topmost: true,
-            frame_rate: FrameRate::Fps30,
-            has_source: true,
-        };
-        let decoded = decode_state(encode_state(state));
-        assert!(!decoded.visible);
-        assert!(decoded.interaction);
-        assert!(decoded.topmost);
-        assert_eq!(decoded.frame_rate, FrameRate::Fps30);
-        assert!(decoded.has_source);
-    }
-
-    #[test]
-    fn frame_rate_commands_map_to_explicit_rates() {
-        assert_eq!(
-            action_from_command(CMD_FPS_60),
-            Some(TrayAction::SetFrameRate(FrameRate::Fps60))
-        );
-        assert_eq!(action_from_command(0), None);
-        assert_eq!(action_from_command(CMD_SOURCE_BASE + 3), None);
-    }
-
-    #[test]
-    fn source_command_resolves_against_the_visible_menu_snapshot() {
-        let sources = SourceMenuState {
-            names: vec![SenderName::for_test("Alpha"), SenderName::for_test("Beta")],
-            selected: None,
-        };
-
-        let selected = source_for_command(&sources, CMD_SOURCE_BASE + 1).unwrap();
-        assert_eq!(selected.display_name(), "Beta");
-    }
+    });
 }

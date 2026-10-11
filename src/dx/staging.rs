@@ -14,10 +14,12 @@ struct ReadbackSlot {
 }
 
 pub struct AlphaReadback {
+    target: ID3D11Resource,
     target_rtv: ID3D11RenderTargetView,
     slots: Vec<ReadbackSlot>,
     pending: VecDeque<usize>,
     next_write: usize,
+    epochs: [u64; READBACK_BUFFER_COUNT],
     width: u32,
     height: u32,
 }
@@ -50,6 +52,7 @@ impl AlphaReadback {
         let mut target_rtv = None;
         unsafe { device.CreateRenderTargetView(&target, None, Some(&mut target_rtv))? };
         let target_rtv = target_rtv.ok_or_else(crate::dx::missing_object)?;
+        let target = target.cast()?;
 
         let staging_desc = D3D11_TEXTURE2D_DESC {
             Usage: D3D11_USAGE_STAGING,
@@ -68,10 +71,12 @@ impl AlphaReadback {
         }
 
         Ok(Self {
+            target,
             target_rtv,
             slots,
             pending: VecDeque::with_capacity(READBACK_BUFFER_COUNT),
             next_write: 0,
+            epochs: [0; READBACK_BUFFER_COUNT],
             width,
             height,
         })
@@ -82,9 +87,10 @@ impl AlphaReadback {
         context: &ID3D11DeviceContext,
         pipeline: &crate::dx::pipeline::Pipeline,
         source: &ID3D11ShaderResourceView,
-    ) -> windows::core::Result<bool> {
+        epoch: u64,
+    ) -> bool {
         if self.pending.len() == self.slots.len() {
-            return Ok(false);
+            return false;
         }
 
         let index = self.next_write;
@@ -107,21 +113,21 @@ impl AlphaReadback {
             context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             context.Draw(3, 0);
 
-            let target: ID3D11Resource = self.target_rtv.GetResource()?;
-            context.CopyResource(&self.slots[index].resource, &target);
+            context.CopyResource(&self.slots[index].resource, &self.target);
         }
         self.pending.push_back(index);
+        self.epochs[index] = epoch;
         self.next_write = (index + 1) % self.slots.len();
-        Ok(true)
+        true
     }
 
     pub fn try_read(
         &mut self,
         context: &ID3D11DeviceContext,
         alpha: &mut Vec<u8>,
-    ) -> windows::core::Result<bool> {
+    ) -> windows::core::Result<Option<u64>> {
         let Some(&index) = self.pending.front() else {
-            return Ok(false);
+            return Ok(None);
         };
 
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -136,7 +142,7 @@ impl AlphaReadback {
         };
         if let Err(error) = map_result {
             if error.code() == DXGI_ERROR_WAS_STILL_DRAWING {
-                return Ok(false);
+                return Ok(None);
             }
             self.pending.pop_front();
             return Err(error);
@@ -161,6 +167,15 @@ impl AlphaReadback {
 
         unsafe { context.Unmap(&self.slots[index].texture, 0) };
         self.pending.pop_front();
-        Ok(true)
+        Ok(Some(self.epochs[index]))
+    }
+
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    pub fn discard_pending(&mut self) {
+        self.pending.clear();
+        self.next_write = 0;
     }
 }

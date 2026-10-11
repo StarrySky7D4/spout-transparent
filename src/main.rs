@@ -1,9 +1,17 @@
 #![windows_subsystem = "windows"]
 
 mod app;
-mod config;
+mod crop;
+#[cfg(debug_assertions)]
+mod diagnostics;
 mod dx;
+mod error;
+mod events;
+mod frame_pacer;
 mod interaction;
+mod renderer;
+mod scheduler;
+mod source;
 mod spout;
 mod tray;
 

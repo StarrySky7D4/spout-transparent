@@ -1,0 +1,37 @@
+[
+  {
+    "Hwnd": "1905194",
+    "ThreadId": 10216,
+    "Title": "Spout Receiver (Transparent)"
+  },
+  {
+    "Hwnd": "397228",
+    "ThreadId": 8024,
+    "Title": "Spout Transparent Tray"
+  },
+  {
+    "Hwnd": "659984",
+    "ThreadId": 10216,
+    "Title": ""
+  },
+  {
+    "Hwnd": "266834",
+    "ThreadId": 10216,
+    "Title": "MSCTFIME UI"
+  },
+  {
+    "Hwnd": "1118724",
+    "ThreadId": 10216,
+    "Title": "Default IME"
+  },
+  {
+    "Hwnd": "331942",
+    "ThreadId": 8024,
+    "Title": "MSCTFIME UI"
+  },
+  {
+    "Hwnd": "331690",
+    "ThreadId": 8024,
+    "Title": "Default IME"
+  }
+]

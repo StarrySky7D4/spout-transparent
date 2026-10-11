@@ -1,0 +1,14 @@
+{
+  "Date": "2026-10-11",
+  "Timezone": "Asia/Shanghai",
+  "Cpu": "Intel Core Ultra 5 225H",
+  "PhysicalCores": 14,
+  "LogicalProcessors": 14,
+  "Gpu": "Intel Arc 130T GPU",
+  "Driver": "32.0.101.6874",
+  "GitBase": "a91550f106b69eb70320decf91b27f6426dd138e",
+  "SourceState": "Uncommitted current event/deadline architecture",
+  "ReceiverPid": 39968,
+  "ReceiverImageSha256": "3FCA5154174FC0A87C699163EB1C3FE9945F91C05FDECDE87BB17F9AA614CC76",
+  "Note": "Live receiver was not restarted or reconfigured. Its executable predates only the measurement harness additions. Component runs used synthetic textures, not its live sender."
+}

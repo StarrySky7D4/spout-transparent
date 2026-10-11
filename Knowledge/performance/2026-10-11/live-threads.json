@@ -1,0 +1,158 @@
+{
+  "Pid": 39968,
+  "SampleSeconds": 8.011293,
+  "CpuSeconds": 0.796875,
+  "CpuMachinePercent": 0.7104925866167029,
+  "CpuOneCorePercent": 9.94689621263384,
+  "WorkingSetMiB": 23.41015625,
+  "PrivateMiB": 51.234375,
+  "Gpu3DPercentSnapshot": 9.0,
+  "GpuSharedMiB": 28.9296875,
+  "Threads": [
+    {
+      "Id": 10216,
+      "Name": "unnamed",
+      "CpuMilliseconds": 359.375,
+      "OneCorePercent": 4.485855154717222
+    },
+    {
+      "Id": 30624,
+      "Name": "unnamed",
+      "CpuMilliseconds": 218.75,
+      "OneCorePercent": 2.730520528958309
+    },
+    {
+      "Id": 36344,
+      "Name": "unnamed",
+      "CpuMilliseconds": 171.875,
+      "OneCorePercent": 2.1454089870386714
+    },
+    {
+      "Id": 41304,
+      "Name": "unnamed",
+      "CpuMilliseconds": 31.25,
+      "OneCorePercent": 0.3900743612797585
+    },
+    {
+      "Id": 26604,
+      "Name": "unnamed",
+      "CpuMilliseconds": 15.625,
+      "OneCorePercent": 0.19503718063987924
+    },
+    {
+      "Id": 21200,
+      "Name": "unnamed",
+      "CpuMilliseconds": 0.0,
+      "OneCorePercent": 0.0
+    },
+    {
+      "Id": 30372,
+      "Name": "unnamed",
+      "CpuMilliseconds": 0.0,
+      "OneCorePercent": 0.0
+    },
+    {
+      "Id": 8024,
+      "Name": "unnamed",
+      "CpuMilliseconds": 0.0,
+      "OneCorePercent": 0.0
+    },
+    {
+      "Id": 32352,
+      "Name": "unnamed",
+      "CpuMilliseconds": 0.0,
+      "OneCorePercent": 0.0
+    },
+    {
+      "Id": 11432,
+      "Name": "unnamed",
+      "CpuMilliseconds": 0.0,
+      "OneCorePercent": 0.0
+    },
+    {
+      "Id": 34640,
+      "Name": "unnamed",
+      "CpuMilliseconds": 0.0,
+      "OneCorePercent": 0.0
+    },
+    {
+      "Id": 13556,
+      "Name": "unnamed",
+      "CpuMilliseconds": 0.0,
+      "OneCorePercent": 0.0
+    },
+    {
+      "Id": 21348,
+      "Name": "unnamed",
+      "CpuMilliseconds": 0.0,
+      "OneCorePercent": 0.0
+    },
+    {
+      "Id": 42940,
+      "Name": "unnamed",
+      "CpuMilliseconds": 0.0,
+      "OneCorePercent": 0.0
+    },
+    {
+      "Id": 4008,
+      "Name": "unnamed",
+      "CpuMilliseconds": 0.0,
+      "OneCorePercent": 0.0
+    },
+    {
+      "Id": 15428,
+      "Name": "unnamed",
+      "CpuMilliseconds": 0.0,
+      "OneCorePercent": 0.0
+    },
+    {
+      "Id": 42096,
+      "Name": "unnamed",
+      "CpuMilliseconds": 0.0,
+      "OneCorePercent": 0.0
+    },
+    {
+      "Id": 41368,
+      "Name": "unnamed",
+      "CpuMilliseconds": 0.0,
+      "OneCorePercent": 0.0
+    },
+    {
+      "Id": 38208,
+      "Name": "unnamed",
+      "CpuMilliseconds": 0.0,
+      "OneCorePercent": 0.0
+    },
+    {
+      "Id": 26096,
+      "Name": "unnamed",
+      "CpuMilliseconds": 0.0,
+      "OneCorePercent": 0.0
+    },
+    {
+      "Id": 38980,
+      "Name": "unnamed",
+      "CpuMilliseconds": 0.0,
+      "OneCorePercent": 0.0
+    },
+    {
+      "Id": 36612,
+      "Name": "unnamed",
+      "CpuMilliseconds": 0.0,
+      "OneCorePercent": 0.0
+    },
+    {
+      "Id": 35380,
+      "Name": "unnamed",
+      "CpuMilliseconds": 0.0,
+      "OneCorePercent": 0.0
+    },
+    {
+      "Id": 31316,
+      "Name": "unnamed",
+      "CpuMilliseconds": 0.0,
+      "OneCorePercent": 0.0
+    }
+  ],
+  "Note": "Read-only 8-second sample after benchmark and compilation; live UI workload/settings unchanged and uncontrolled"
+}
