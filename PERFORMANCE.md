@@ -10,7 +10,7 @@ the window scale relative to the sender.
 
 ## 当前验证状态（2026-10-15）
 
-当前为 `lib/`、`bin/` workspace。库包 `spout-transparent` 有 4 个直接依赖，
+当前 workspace 包含 `lib/`、`lib/c-api/` 和 `bin/`。库包 `spout-transparent` 有 4 个直接依赖，
 应用包 `spout-transparent-app` 保留 winit、托盘、热键和日志后端。
 性能基准在 `bin/benches/`，通过正常包依赖使用库，默认结果目录仍是仓库根目录的 `target/performance`。
 
@@ -20,13 +20,18 @@ the window scale relative to the sender.
 | 库公开 API 集成测试 | 2 项通过 |
 | 应用单元测试 | 20 项通过，包括事件循环与合成测试 |
 | 独立任务栏窗口测试 | 1 项通过 |
+| C ABI Rust 边界测试 | 2 项通过，覆盖 unwind 隔离与原生错误码保留 |
+| C11 / C++17 DLL 客户端 | Debug / Release 共 4 次 GPU 验证通过；另可显式跳过 GPU |
 | rustdoc 示例 | 3 项编译通过 |
 | Debug / Release Clippy | workspace 全目标、警告作为错误，通过 |
 | Release 程序 / 独立基准 | 构建通过 |
 | SDK 本地打包 | `.crate` 生成并在独立包目录编译校验通过；没有发布到 crates.io |
+| C SDK 打包与示例 | DLL / 导入库 / 头文件 / 文档生成，CMake C 示例编译运行通过 |
 
-共 57 项测试，其中 6 项默认忽略的平台测试已显式运行；另有 3 个文档示例。
-拆分没有升级外部依赖，也未重新采集性能数据。下面的旧模型、18/45 项测试记录和
+共 59 项 Rust 测试，其中 6 项默认忽略的平台测试已显式运行；另有 3 个文档示例及上述原生客户端验证。
+C ABI GPU 夹具使用独立命名的 16×16 共享 keyed texture，不写全局 Sender 名单，验证完整像素、锁忙和布局，
+不代表真实 Sender 的吞吐量。C 宿主默认关闭 Alpha，显式开启后复用同一套 R8 回读资源。
+拆分与封装没有升级外部依赖，也未重新采集性能数据。下面的旧模型、18/45 项测试记录和
 2026-10-11 测量结果属于对应阶段，不能当作本次重构后的新测量。
 
 ```powershell
@@ -35,6 +40,9 @@ cargo clippy --workspace --all-targets --locked --no-deps -- -D warnings
 cargo clippy --workspace --release --all-targets --locked --no-deps -- -D warnings
 cargo build --workspace --release --locked
 cargo bench -p spout-transparent-app --bench performance --locked --no-run
+& ./lib/c-api/tests/run.ps1
+& ./lib/c-api/tests/run.ps1 -Configuration Debug
+& ./lib/c-api/build-sdk.ps1
 ```
 
 ## Historical verification baseline (before the workspace split)

@@ -65,6 +65,7 @@ GPU 接收和 Alpha 测试在库包中，应使用 `cargo test --workspace --loc
 应用模块位于 `src/app/`、`src/events.rs`、`src/interaction/`、`src/tray.rs` 与 `src/tray/`。
 基准通过 Cargo 依赖调用真实库，不嵌入库源码。复用接收与渲染能力时应依赖库包，
 而不是复制应用内部模块；入口见 [SDK 指南](../lib/README.md)。
+C / C++ 集成见 [C ABI 指南](../lib/c-api/README.md)，DLL 自身不管理应用的窗口样式、输入或托盘。
 
 分发时同时保留仓库的 [LICENSE](../LICENSE)、[NOTICE](../NOTICE) 与
 [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)。

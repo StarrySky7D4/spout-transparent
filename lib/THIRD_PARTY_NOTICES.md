@@ -6,11 +6,13 @@ The Rust receiver implements compatibility with the public Spout2 shared-memory 
 
 ## Workspace distribution
 
-The workspace contains the `spout-transparent` library in `lib/` and the
+The workspace contains the `spout-transparent` library in `lib/`, the
+`spout-transparent-capi` C ABI facade in `lib/c-api/`, and the
 `spout-transparent-app` desktop application in `bin/`. The library package carries
 its own copies of `LICENSE`, `NOTICE`, and `THIRD_PARTY_NOTICES.md` so attribution
 remains available when the package is distributed separately from this repository.
 The Spout2 notice below applies to the compatible protocol implementation in the library.
+The generated C ABI SDK also includes these license and attribution files.
 
 ## Spout2
 

@@ -1,5 +1,5 @@
 [workspace]
-members = ["lib", "bin"]
+members = ["lib", "lib/c-api", "bin"]
 default-members = ["lib", "bin"]
 resolver = "2"
 

@@ -6,6 +6,10 @@
 库不依赖 winit、serde 或 env_logger，不创建应用窗口、注册全局热键或初始化全局日志。
 窗口、事件循环和生命周期由宿主程序控制；可在自己的 UI 框架中集成。
 
+C / C++ 宿主可使用独立的
+[C ABI DLL 与头文件](https://github.com/StarrySky7D4/spout-transparent/blob/main/lib/c-api/README.md)。
+该封装位于仓库 `lib/c-api/`，有独立构建脚本与原生客户端测试，不增加本 Rust 库的直接依赖。
+
 ## 引入
 
 在第三方项目的 `Cargo.toml` 添加本地路径依赖（指向仓库中的 `lib/`）：

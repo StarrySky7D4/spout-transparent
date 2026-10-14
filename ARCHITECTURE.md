@@ -5,7 +5,8 @@
 ## 从哪里开始阅读
 
 仓库根目录是 Cargo workspace：`lib/` 是库包 `spout-transparent`，`bin/` 是应用包
-`spout-transparent-app`。应用生成的文件名仍为 `spout-transparent.exe`。
+`spout-transparent-app`，`lib/c-api/` 是独立 C ABI 包 `spout-transparent-capi`。
+默认成员为 Rust 库和应用，`--workspace` 包含 C ABI DLL。应用文件名仍为 `spout-transparent.exe`。
 第三方集成从 [库指南](lib/README.md) 和 `lib/src/lib.rs` 的公开 API 开始。
 查看应用流程时，从 `bin/src/events.rs` 进入 `bin/src/app/runtime.rs`，再追踪它对库的调用。协议细节与原生资源清理由相应子模块负责。
 
@@ -35,6 +36,9 @@
 | `bin/src/tray.rs` / `bin/src/tray/menu.rs` | 托盘线程与菜单构建 | 菜单来源命令按打开时的快照解释 |
 | `lib/src/error.rs` | 子系统上下文与错误原因链 | 原生错误保留类型，便于定位 HRESULT / OS 错误 |
 | `lib/src/diagnostics.rs` | Debug 日志和可选位图诊断 | 不编入 Release 应用 |
+| `lib/c-api/src/boundary.rs` | C 句柄注册表、指针检查、状态码与 unwind 边界 | 每线程所有权；不向宿主转交 Rust 内存 |
+| `lib/c-api/src/receiver.rs` / `crop.rs` | 来源与稳定裁切 C 接口 | 原始名字字节、显式时间与宿主缓冲区 |
+| `lib/c-api/src/rendering.rs` | HWND 合成与渲染 C 接口 | 同线程 COM；完整身份校验；Alpha 默认关闭 |
 
 较大的原生渲染测试单独放在 `bin/src/app/tests.rs` 和 `lib/src/renderer/tests.rs`。
 纯逻辑测试仍与实现靠近，避免阅读日常流程时穿过大量 GPU 测试装配代码。
@@ -116,6 +120,12 @@ cargo bench -p spout-transparent-app --bench performance --locked --target-dir t
 添加可复用功能时放入 `lib/`，并通过 `lib/tests/` 或 rustdoc 示例验证外部可达性；应用交互放在 `bin/`。
 不要恢复跨包的源码路径引用来访问库私有实现。包内的原生句柄和 COM 生命周期仍需遵守对应接口契约。
 
+C / C++ 宿主通过 [C ABI 指南](lib/c-api/README.md) 和头文件接入，不直接依赖 Rust 类型布局。
+封装复用同一库，采用线程本地句柄注册表和单调编号，入口将可恢复 unwind 转换为状态码。
+发现、元数据轮询、帧期限、Alpha 读取与布局由宿主显式调度；不隐式创建应用事件循环。
+Alpha 缓冲区容量探测保留样本，关闭功能或重新安装来源时清理样本与旧 epoch。
+扩展接口时同步修改头文件和 C/C++ 原生测试，保持结构对齐、调用约定及 ABI 主版本契约。
+
 本地验证 SDK 打包：
 
 ```powershell
@@ -129,7 +139,8 @@ cargo package -p spout-transparent --allow-dirty --locked --offline
 ## 当前验证快照（2026-10-15）
 
 库单元测试 34 项、库公开 API 集成测试 2 项、应用单元测试 20 项、独立任务栏测试 1 项，
-全部显式运行后共 57 项通过；另有 3 个 rustdoc 示例编译通过。
+加上 C ABI 边界单元测试 2 项，全部显式运行后共 59 项通过；另有 3 个 rustdoc 示例编译通过。
+C11 / C++17 客户端在 Debug 和 Release 下均通过共享 keyed texture、Alpha 回读和真实 HWND 布局测试。
 Debug/Release 的 workspace 全目标严格 Clippy、Release 程序、独立基准和 SDK 打包校验通过。
 外部依赖版本未升级。历史测量原始文件没有改写；测试明细与范围见 [PERFORMANCE.md](PERFORMANCE.md)。
 

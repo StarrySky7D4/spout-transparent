@@ -4,13 +4,14 @@
 
 接收端完全由 Rust 实现，直接使用 Win32 共享内存和 Direct3D 11 API；运行时不需要 `SpoutLibrary.dll`，构建时也不需要 CMake、LLVM/libclang 或 C++ Spout SDK。
 
-项目采用 Cargo workspace，库和桌面应用分别位于 `lib/` 与 `bin/`：
+项目采用 Cargo workspace，Rust 库、C ABI 和桌面应用分别维护：
 
 ```text
 lib/                 spout-transparent：可复用接收、渲染、裁切和调度库
   src/               库实现与公开 API
   examples/          查询和监控 Sender 的可运行示例
   tests/             第三方视角的公开 API 集成测试
+  c-api/             spout-transparent-capi：C ABI DLL、头文件与原生客户端测试
 bin/                 spout-transparent-app：透明窗口、托盘、热键应用
   src/               应用入口与 UI 协调
   tests/             独立窗口回归测试
@@ -28,6 +29,7 @@ bin/                 spout-transparent-app：透明窗口、托盘、热键应�
 | 文档 | 用途 |
 | --- | --- |
 | [库接入指南](lib/README.md) | 第三方依赖、发现回调、已有 HWND 渲染与示例 |
+| [C / C++ 接入指南](lib/c-api/README.md) | C ABI、DLL SDK 打包、宿主调度与原生测试 |
 | [应用开发指南](bin/README.md) | 启动、配置查找、窗口与托盘行为 |
 | [架构与维护](ARCHITECTURE.md) | 模块所有权、不变量、参数与迁移边界 |
 | [性能模型与当前验证](PERFORMANCE.md) | 资源预算、测量范围和测试状态 |
@@ -160,9 +162,12 @@ cargo build --workspace --release --locked
 
 ```text
 target\release\spout-transparent.exe
+target\release\spout_transparent_c.dll
 ```
 
 可执行文件可单独复制运行，无需附带项目文件或额外 Spout DLL。
+C / C++ 宿主可运行 `./lib/c-api/build-sdk.ps1`，将 DLL、导入库、头文件和示例整理到
+`target/c-api-sdk/release/`。宿主使用 C ABI DLL 时需要随其分发 DLL。
 
 ## 开发与测试
 
@@ -173,8 +178,11 @@ cargo clippy --workspace --all-targets --locked --no-deps -- -D warnings
 cargo build --workspace --release --locked
 ```
 
-2026-10-15 全量验证：57 项测试通过（包含 6 项默认忽略的平台测试），另有 3 个 rustdoc 示例编译通过；
-Debug/Release 严格 Clippy、Release 构建、基准编译和 SDK 本地打包校验通过。当前未重新采集性能数据。
+2026-10-15 全量验证：59 项 Rust 测试通过（包含 6 项默认忽略的平台测试），另有 3 个 rustdoc 示例编译通过；
+C11 / C++17 的 Debug、Release DLL 客户端均通过共享纹理与 Alpha GPU 测试。
+原生验证命令为 `./lib/c-api/tests/run.ps1`，添加 `-Configuration Debug` 可测 Debug DLL，需要 x64 MSVC 开发者终端。
+Debug/Release 严格 Clippy、Release 构建、基准编译、Rust SDK 本地打包和 C SDK 示例构建校验通过。
+当前未重新采集性能数据。
 
 Debug 应用构建会打开日志控制台；仅依赖库不会初始化控制台或日志后端。需要更详细的日志时：
 

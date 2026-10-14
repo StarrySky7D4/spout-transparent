@@ -3,5 +3,6 @@ Copyright 2026 StarrySky7D4
 
 Third-party attribution notices are provided in THIRD_PARTY_NOTICES.md.
 
-Workspace components: spout-transparent library (lib/) and
+Workspace components: spout-transparent library (lib/),
+spout-transparent-capi C ABI facade (lib/c-api/), and
 spout-transparent-app desktop application (bin/).
