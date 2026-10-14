@@ -1,5 +1,11 @@
 # Static Audit — Residual Render and Tray Stalls
 
+> Archive note (2026-10-15): this is a static review of the commits listed below,
+> not a verification of the current workspace. Current modules live in `lib/` and `bin/`;
+> see the [architecture guide](../ARCHITECTURE.md) and [current validation](../PERFORMANCE.md).
+> The 67 ms timeout applies to an individual registry-lock wait, not the complete discovery
+> scan or worker shutdown. Original review scope and findings are retained below.
+
 - Repository: `StarrySky7D4/spout-transparent`
 - Source: `AutoSave`
 - Target: `main`

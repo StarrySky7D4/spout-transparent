@@ -4,8 +4,35 @@
 
 接收端完全由 Rust 实现，直接使用 Win32 共享内存和 Direct3D 11 API；运行时不需要 `SpoutLibrary.dll`，构建时也不需要 CMake、LLVM/libclang 或 C++ Spout SDK。
 
+项目采用 Cargo workspace，库和桌面应用分别位于 `lib/` 与 `bin/`：
+
+```text
+lib/                 spout-transparent：可复用接收、渲染、裁切和调度库
+  src/               库实现与公开 API
+  examples/          查询和监控 Sender 的可运行示例
+  tests/             第三方视角的公开 API 集成测试
+bin/                 spout-transparent-app：透明窗口、托盘、热键应用
+  src/               应用入口与 UI 协调
+  tests/             独立窗口回归测试
+  benches/           链接实际库的性能基准
+```
+
+第三方接入、事件回调和 HWND 渲染示例见 [`lib/README.md`](lib/README.md)。
+库不依赖 winit、serde 或 env_logger，宿主可以使用自己的事件循环、窗口框架和日志系统。
+
 项目结构、资源开销模型和优化验证记录见 [`PERFORMANCE.md`](PERFORMANCE.md)。
 当前模块职责、状态不变量和修改入口见 [`ARCHITECTURE.md`](ARCHITECTURE.md)。
+
+## 文档导航
+
+| 文档 | 用途 |
+| --- | --- |
+| [库接入指南](lib/README.md) | 第三方依赖、发现回调、已有 HWND 渲染与示例 |
+| [应用开发指南](bin/README.md) | 启动、配置查找、窗口与托盘行为 |
+| [架构与维护](ARCHITECTURE.md) | 模块所有权、不变量、参数与迁移边界 |
+| [性能模型与当前验证](PERFORMANCE.md) | 资源预算、测量范围和测试状态 |
+| [历史记录索引](Knowledge/README.md) | 按时间查看审计、四轮实测与后续状态 |
+| [第三方归属](THIRD_PARTY_NOTICES.md) | Spout2 协议参考与分发声明 |
 
 ## 功能
 
@@ -36,6 +63,7 @@
 没有可用 Sender 时，程序不会退出，而是隐藏窗口并常驻系统托盘。Sender 出现后会自动连接并显示窗口；运行期间 Sender 暂时关闭时，窗口会再次隐藏并等待重连。
 
 程序不会显示任务栏图标。需要隐藏、恢复或退出窗口时，请使用系统托盘中的 `Spout Transparent` 图标。
+窗口创建时启用任务栏隐藏，并在显示、隐藏或样式更新时持续保持工具窗口标志。
 
 ## 托盘菜单
 
@@ -125,7 +153,7 @@
 在项目根目录执行：
 
 ```powershell
-cargo build --release --locked
+cargo build --workspace --release --locked
 ```
 
 产物位于：
@@ -140,45 +168,59 @@ target\release\spout-transparent.exe
 
 ```powershell
 cargo fmt --all -- --check
-cargo test --locked
-cargo clippy --all-targets --locked --no-deps -- -D warnings
-cargo build --release --locked
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked --no-deps -- -D warnings
+cargo build --workspace --release --locked
 ```
 
-Debug 构建会打开日志控制台。需要更详细的日志时：
+2026-10-15 全量验证：57 项测试通过（包含 6 项默认忽略的平台测试），另有 3 个 rustdoc 示例编译通过；
+Debug/Release 严格 Clippy、Release 构建、基准编译和 SDK 本地打包校验通过。当前未重新采集性能数据。
+
+Debug 应用构建会打开日志控制台；仅依赖库不会初始化控制台或日志后端。需要更详细的日志时：
 
 ```powershell
 $env:RUST_LOG = 'debug'
-cargo run --locked
+cargo run -p spout-transparent-app --locked
 ```
 
 在支持 D3D11 的 Windows 环境中，可额外运行像素级渲染、共享纹理、Alpha 会话与事件顺序验证：
 
 ```powershell
-cargo test --locked -- --ignored
+cargo test --workspace --locked -- --ignored
 ```
 
 一次运行全部测试，包括这些平台测试：
 
 ```powershell
-cargo test --locked -- --include-ignored
+cargo test --workspace --locked -- --include-ignored
 ```
 
 运行独立 Release 性能测量（CPU 边界扫描、GPU 时间戳、Alpha 回读和事件递送）：
 
 ```powershell
-cargo bench --bench performance --locked --target-dir target/performance-build
+cargo bench -p spout-transparent-app --bench performance --locked --target-dir target/performance-build
 ```
 
-结果默认写入 `target/performance`；可通过 `SPOUT_PERF_OUTPUT` 指定结果目录。
+结果默认写入仓库根目录的 `target/performance`；`SPOUT_PERF_OUTPUT` 建议指定绝对路径。
 测试使用合成纹理，不会注册新 Sender 或修改正在运行的接收端。
 本机四轮结果与范围说明见 [性能测试记录](Knowledge/2026-10-11-performance-results.md)。
+
+只检查库、运行无窗口示例或生成 API 文档：
+
+```powershell
+cargo check -p spout-transparent --lib --locked
+cargo run -p spout-transparent --example list_senders --locked
+cargo doc -p spout-transparent --no-deps --locked
+```
+
+生成的 API 文档入口为 `target/doc/spout_transparent/index.html`。库的本地依赖路径是仓库下的 `lib/`；
+可执行程序的 Cargo 包名为 `spout-transparent-app`，生成的文件名仍是 `spout-transparent.exe`。
 
 采集 Sender 纹理和合成 BackBuffer 的诊断位图：
 
 ```powershell
 $env:SPOUT_DEBUG_CAPTURE = '1'
-cargo run --locked
+cargo run -p spout-transparent-app --locked
 ```
 
 诊断位图写入可执行文件所在目录，并已由 `.gitignore` 排除。

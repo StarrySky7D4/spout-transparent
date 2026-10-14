@@ -2,13 +2,42 @@
 
 最新实测见 [2026-10-11 性能测试结果](Knowledge/2026-10-11-performance-results.md)：
 包含四轮 Release CPU/GPU/事件测量，以及已有 720p 接收端的只读现场采样。
-当前重构后的模块结构见 [模块契约与维护指南](ARCHITECTURE.md)。下文带日期的结构表保留历史路径。
+当前库/应用 workspace 的结构见 [模块契约与维护指南](ARCHITECTURE.md)。下文带日期的结构表保留历史路径。
 
 This document records the baseline observed before the source-resolution rendering and Alpha
 readback work, plus the expected resource model after it. `N = width * height` pixels and `k` is
 the window scale relative to the sender.
 
-## Verification baseline
+## 当前验证状态（2026-10-15）
+
+当前为 `lib/`、`bin/` workspace。库包 `spout-transparent` 有 4 个直接依赖，
+应用包 `spout-transparent-app` 保留 winit、托盘、热键和日志后端。
+性能基准在 `bin/benches/`，通过正常包依赖使用库，默认结果目录仍是仓库根目录的 `target/performance`。
+
+| 验证范围 | 结果 |
+| --- | --- |
+| 库单元测试 | 34 项通过，包括显式运行的 GPU 测试 |
+| 库公开 API 集成测试 | 2 项通过 |
+| 应用单元测试 | 20 项通过，包括事件循环与合成测试 |
+| 独立任务栏窗口测试 | 1 项通过 |
+| rustdoc 示例 | 3 项编译通过 |
+| Debug / Release Clippy | workspace 全目标、警告作为错误，通过 |
+| Release 程序 / 独立基准 | 构建通过 |
+| SDK 本地打包 | `.crate` 生成并在独立包目录编译校验通过；没有发布到 crates.io |
+
+共 57 项测试，其中 6 项默认忽略的平台测试已显式运行；另有 3 个文档示例。
+拆分没有升级外部依赖，也未重新采集性能数据。下面的旧模型、18/45 项测试记录和
+2026-10-11 测量结果属于对应阶段，不能当作本次重构后的新测量。
+
+```powershell
+cargo test --workspace --locked -- --include-ignored
+cargo clippy --workspace --all-targets --locked --no-deps -- -D warnings
+cargo clippy --workspace --release --all-targets --locked --no-deps -- -D warnings
+cargo build --workspace --release --locked
+cargo bench -p spout-transparent-app --bench performance --locked --no-run
+```
+
+## Historical verification baseline (before the workspace split)
 
 - `cargo test`: 18 tests passed.
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed.

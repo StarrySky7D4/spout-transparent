@@ -1,5 +1,8 @@
 # 性能测试结果（2026-10-11）
 
+> 归档说明（2026-10-15）：以下数值来自 2026-10-11 的四轮测量，没有因 workspace 拆分而重新测量。
+> 当前基准已迁至 `bin/benches/`，复现命令按新结构更新；当前验证见 [PERFORMANCE.md](../PERFORMANCE.md)。
+
 测试对象为当前事件＋独立期限架构。CPU 为 Intel Core Ultra 5 225H，14 核/14 线程；
 GPU 为 Intel Arc 130T，驱动 32.0.101.6874。测试程序使用 Release 优化编译。
 当前源码含尚未提交的改动，Git 基础版本为 a91550f106b69eb70320decf91b27f6426dd138e。
@@ -104,23 +107,24 @@ GPU 时间戳完成不一定意味着非阻塞 Map 在 CPU 侧已经可用：生
 
 ## 5. 复现与原始数据
 
-可复用测试代码：[measurements.rs](/C:/Users/19825/Desktop/CodexProject/spout-transparent/benches/support/measurements.rs)。
-独立 Cargo bench 可执行文件编译该模块，正常应用和常规测试不包含测量逻辑。
+可复用测试代码：[measurements.rs](../bin/benches/support/measurements.rs)。
+独立 Cargo bench 可执行文件编译测量模块并链接实际库，正常应用和常规测试不包含测量逻辑。
 
 ```powershell
-$env:SPOUT_PERF_OUTPUT = 'target/performance/retest'
-cargo bench --bench performance --locked --target-dir target/performance-build
+$env:SPOUT_PERF_OUTPUT = Join-Path (Get-Location) 'target/performance/retest'
+cargo bench -p spout-transparent-app --bench performance --locked --target-dir target/performance-build
 ```
 
+上述命令在仓库根目录运行，输出使用绝对路径，避免 Cargo 工作目录差异。
 独立构建目录避免 Windows 锁定正在运行的 `target/release/spout-transparent.exe`，测试无需停止已有接收端。
 
 数据包含每个样本、各轮中位数/P95、现场进程与线程读取、硬件和运行二进制哈希：
 
-- [四轮汇总 CSV](/C:/Users/19825/Desktop/CodexProject/spout-transparent/Knowledge/performance/2026-10-11/aggregate.csv)
-- [第一轮原始结果](/C:/Users/19825/Desktop/CodexProject/spout-transparent/Knowledge/performance/2026-10-11/run-1/results.json)
-- [第二轮原始结果](/C:/Users/19825/Desktop/CodexProject/spout-transparent/Knowledge/performance/2026-10-11/run-2/results.json)
-- [第三轮原始结果](/C:/Users/19825/Desktop/CodexProject/spout-transparent/Knowledge/performance/2026-10-11/run-3/results.json)
-- [第四轮 bench 验证结果](/C:/Users/19825/Desktop/CodexProject/spout-transparent/Knowledge/performance/2026-10-11/run-4/results.json)
-- [现场线程采样](/C:/Users/19825/Desktop/CodexProject/spout-transparent/Knowledge/performance/2026-10-11/live-threads.json)
-- [现场多点采样](/C:/Users/19825/Desktop/CodexProject/spout-transparent/Knowledge/performance/2026-10-11/live-process.json)
-- [环境与版本信息](/C:/Users/19825/Desktop/CodexProject/spout-transparent/Knowledge/performance/2026-10-11/environment.json)
+- [四轮汇总 CSV](performance/2026-10-11/aggregate.csv)
+- [第一轮原始结果](performance/2026-10-11/run-1/results.json)
+- [第二轮原始结果](performance/2026-10-11/run-2/results.json)
+- [第三轮原始结果](performance/2026-10-11/run-3/results.json)
+- [第四轮 bench 验证结果](performance/2026-10-11/run-4/results.json)
+- [现场线程采样](performance/2026-10-11/live-threads.json)
+- [现场多点采样](performance/2026-10-11/live-process.json)
+- [环境与版本信息](performance/2026-10-11/environment.json)

@@ -4,6 +4,14 @@ The original code of spout-transparent is licensed under the Apache License, Ver
 
 The Rust receiver implements compatibility with the public Spout2 shared-memory and shared-texture protocol. The following license is retained for the Spout2 protocol implementation used as a reference.
 
+## Workspace distribution
+
+The workspace contains the `spout-transparent` library in `lib/` and the
+`spout-transparent-app` desktop application in `bin/`. The library package carries
+its own copies of `LICENSE`, `NOTICE`, and `THIRD_PARTY_NOTICES.md` so attribution
+remains available when the package is distributed separately from this repository.
+The Spout2 notice below applies to the compatible protocol implementation in the library.
+
 ## Spout2
 
 BSD 2-Clause License

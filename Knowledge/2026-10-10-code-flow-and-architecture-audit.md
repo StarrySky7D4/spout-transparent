@@ -1,5 +1,9 @@
 # 代码流程、结构与模块深度分析
 
+> 文档状态（2026-10-15）：历史审计。下文流程、文件名和行号属于 2026-10-10 的未提交工作区快照，
+> 不是当前代码位置。当前实现与修复状态见 [架构指南](../ARCHITECTURE.md)、
+> [当前验证记录](../PERFORMANCE.md) 和 [SDK 接入指南](../lib/README.md)。
+
 分析日期：2026-10-10。对象为当前工作区，包括上一轮尚未提交的性能优化。
 后续状态（2026-10-11）：稳定自动裁切已实现；下文 A 的 KeyedMutex 精确返回状态判断和 B 的资源代次就绪判断
 已修复并验证。本文其余流程与行号记录对应分析当时的快照，当前代码请结合 README 与 PERFORMANCE.md 阅读。
@@ -48,8 +52,8 @@ flowchart TD
 
 ## 2. 启动流程
 
-入口位于 [main.rs:33](/C:/Users/19825/Desktop/CodexProject/spout-transparent/src/main.rs:33)，主要编排位于
-[app.rs:477](/C:/Users/19825/Desktop/CodexProject/spout-transparent/src/app.rs:477)。
+入口位于 `main.rs:33`，主要编排位于
+`app.rs:477`。
 
 1. 创建 Debug 控制台并初始化日志。
 2. `init_app()` 初始化 COM，创建 D3D11 设备和 Immediate Context；优先硬件设备，失败后尝试 WARP。
@@ -103,7 +107,7 @@ flowchart LR
 ## 4. 主循环一轮究竟执行什么
 
 `WindowEvent` 处理退出、修饰键、滚轮、鼠标按钮和光标移动；主要工作在
-[AboutToWait 分支](/C:/Users/19825/Desktop/CodexProject/spout-transparent/src/app.rs:635)。
+AboutToWait 分支（历史位置 `src/app.rs:635`）。
 
 每轮按以下顺序执行：
 
@@ -126,7 +130,7 @@ Alpha 读取也不要求当前轮有新帧：它消费的是已经入队的本�
 
 ## 5. Sender 状态与资源状态
 
-连接状态位于 [spout.rs:187](/C:/Users/19825/Desktop/CodexProject/spout-transparent/src/spout.rs:187)。
+连接状态位于 `spout.rs:187`。
 
 | 状态/结果 | 当前行为 |
 | --- | --- |
@@ -154,7 +158,7 @@ Alpha 读取也不要求当前轮有新帧：它消费的是已经入队的本�
 交换链尺寸保持 Sender 原始尺寸。滚轮缩放改变 DComp Transform 和窗口尺寸，避免按缩放后的面积重建渲染目标。
 显示与 Alpha 提取都使用相同的全屏三角形及线性采样规则。
 
-Alpha 路径位于 [staging.rs](/C:/Users/19825/Desktop/CodexProject/spout-transparent/src/dx/staging.rs:16)：
+Alpha 路径位于 `staging.rs`：
 
 1. Alpha Pixel Shader 将共享纹理 Alpha 写入一个 R8 渲染目标。
 2. CopyResource 复制至两个 R8 staging 槽位之一。
@@ -172,7 +176,7 @@ Alpha 路径位于 [staging.rs](/C:/Users/19825/Desktop/CodexProject/spout-trans
 
 ### A. P1：KeyedMutex 超时被当作已取得锁——实际 D3D11 复现
 
-位置：[keyed_mutex.rs:11](/C:/Users/19825/Desktop/CodexProject/spout-transparent/src/dx/keyed_mutex.rs:11)。
+位置：`keyed_mutex.rs:11`。
 
 当前代码用 `mutex.AcquireSync(0, 0).is_ok()` 判断拥有纹理。锁的原始 API 返回 HRESULT，
 其中 `WAIT_TIMEOUT=0x102` 和 `WAIT_ABANDONED=0x80` 都是非负值。
@@ -195,8 +199,8 @@ abandoned 返回资源失效事件触发重建。不要再用同一个 `Result<(
 
 ### B. P2：资源就绪判断遗漏 generation——代码路径确定
 
-重建条件检查 generation，位置 [app.rs:742](/C:/Users/19825/Desktop/CodexProject/spout-transparent/src/app.rs:742)；
-但 [source_ready 判断](/C:/Users/19825/Desktop/CodexProject/spout-transparent/src/app.rs:794) 仅检查名称和句柄。
+重建条件检查 generation，位置 `app.rs:742`；
+但 source_ready 判断（历史位置 `src/app.rs:794`） 仅检查名称和句柄。
 
 如果同名 Sender 重建纹理时复用了句柄，元数据代次已经变更，而资源打开或交换链创建失败，旧 GPU 资源仍留在 RenderState。
 由于名称与句柄仍相等，`source_ready` 可以继续为 true；可见窗口仍可能读取旧资源。
@@ -207,8 +211,8 @@ abandoned 返回资源失效事件触发重建。不要再用同一个 `Result<(
 
 ### C. P2：限帧预算从 Present 完成时开始——时间模型复现
 
-位置：[app.rs:955](/C:/Users/19825/Desktop/CodexProject/spout-transparent/src/app.rs:955)、
-[config.rs:97](/C:/Users/19825/Desktop/CodexProject/spout-transparent/src/config.rs:97)。
+位置：`app.rs:955`、
+`config.rs:97`。
 
 每次 Present 返回后才记录 `last_presented_at`，下一帧又完整等待 16.667 ms/33.333 ms 等预算。
 帧起点间隔因此包含绘制和 Present 调用耗时，再加完整限帧间隔，限帧模式容易低于所选上限。
@@ -227,9 +231,9 @@ PACING due_at_start_plus_16_667ms=false, next_start_ms=26.667
 
 ### D. P2：关闭交互不保证立即释放全部 Alpha 内存——引用持有复现
 
-位置：[app.rs:67](/C:/Users/19825/Desktop/CodexProject/spout-transparent/src/app.rs:67)、
-[staging.rs:94](/C:/Users/19825/Desktop/CodexProject/spout-transparent/src/dx/staging.rs:94)、
-[hook_thread.rs:209](/C:/Users/19825/Desktop/CodexProject/spout-transparent/src/interaction/hook_thread.rs:209)。
+位置：`app.rs:67`、
+`staging.rs:94`、
+`hook_thread.rs:209`。
 
 `alpha_readback=None` 会释放对象持有的引用，但 D3D11 Context 也持有绑定 RTV 的引用。
 探针在 enqueue 后 Drop AlphaReadback，查询 Context 仍能取得 RTV：
@@ -249,7 +253,7 @@ CPU 侧的 `rs.alpha_buf`、钩子当前 `mask_alpha` 和邮箱回收缓冲也�
 
 ### E. P2：DComp 安装失败后仍标记资源重建成功——错误处理路径确定
 
-位置：[app.rs:770](/C:/Users/19825/Desktop/CodexProject/spout-transparent/src/app.rs:770)。
+位置：`app.rs:770`。
 
 资源替换阶段忽略 SetScale、SetContent 和 Commit 返回结果，随后更新全部资源身份并记录“重建完成”。
 如果 SetContent/Commit 失败，Renderer 与 DComp 内容可能不一致，后续身份判断也不会再次触发相同重建。
@@ -260,7 +264,7 @@ CPU 侧的 `rs.alpha_buf`、钩子当前 `mask_alpha` 和邮箱回收缓冲也�
 
 ### F. P2：透明点击事件没有主动唤醒主循环——代码路径确定
 
-钩子 [发送 PassthroughEvent](/C:/Users/19825/Desktop/CodexProject/spout-transparent/src/interaction/hook_thread.rs:344)
+钩子 发送 PassthroughEvent（历史位置 `src/interaction/hook_thread.rs:344`）
 后直接吞掉原始事件。事件通道自身不会唤醒 winit；主线程等到下一轮 AboutToWait 才读取。
 托盘动作有 WM_NULL 唤醒，这条鼠标路径没有。
 
@@ -496,3 +500,18 @@ GPU Draw/Map/Present 是否会长时间占用主线程必须采样，单纯限�
 优先验证的调度用例是：无 Sender 的 UI 空闲；发现后及时连接；隐藏后停止帧探测；连续 Toggle 不丢；
 30 FPS 模式下点击穿透无需等待下一帧期限；锁忙后 pending 帧仍存在；来源切换时旧重试/掩码不生效；
 100/500 ms deadline 不导致持续忙循环。性能对比至少记录 UI 唤醒次数、输入转发延迟和 Present 耗时分布。
+
+## 当前代码位置对照（2026-10-15）
+
+此对照用于查找后续实现；原审计的问题描述和旧行号不随重构重写。
+
+| 原职责 | 当前入口 |
+| --- | --- |
+| 程序入口与应用编排 | [bin/src/main.rs](../bin/src/main.rs)、[Runtime](../bin/src/app/runtime.rs) |
+| 限帧与调度 | [FramePacer](../lib/src/frame_pacer.rs)、[Scheduler](../lib/src/scheduler.rs) |
+| Spout 协议与发现 | [Spout façade](../lib/src/spout/mod.rs)、[SourceController](../lib/src/source.rs) |
+| GPU 绘制与回读 | [Renderer](../lib/src/renderer.rs)、[staging](../lib/src/dx/staging.rs) |
+| 精确 keyed mutex 状态 | [keyed_mutex](../lib/src/dx/keyed_mutex.rs) |
+| 鼠标与热键 | [interaction](../bin/src/interaction/mod.rs)、[hotkeys](../bin/src/interaction/hotkeys.rs) |
+| 任务栏隐藏 | [窗口策略](../bin/src/app/platform.rs) |
+| 第三方集成边界 | [库指南](../lib/README.md) |

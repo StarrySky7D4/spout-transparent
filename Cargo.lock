@@ -1218,14 +1218,24 @@ dependencies = [
 name = "spout-transparent"
 version = "0.1.0"
 dependencies = [
+ "log",
+ "thiserror 1.0.69",
+ "windows",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "spout-transparent-app"
+version = "0.1.0"
+dependencies = [
  "env_logger",
  "log",
  "raw-window-handle",
  "serde",
  "serde_json",
+ "spout-transparent",
  "thiserror 1.0.69",
  "windows",
- "windows-sys 0.59.0",
  "winit",
 ]
 
