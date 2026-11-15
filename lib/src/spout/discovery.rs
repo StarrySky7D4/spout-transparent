@@ -31,7 +31,7 @@ pub fn discover_sender_names() -> io::Result<Vec<SenderName>> {
     )?;
     let mut names = Vec::new();
 
-    for slot in bytes.chunks_exact(SENDER_NAME_CAPACITY) {
+    for slot in bytes.as_chunks::<SENDER_NAME_CAPACITY>().0 {
         let Some(name) = SenderName::from_slot(slot) else {
             break;
         };

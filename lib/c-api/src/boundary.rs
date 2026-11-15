@@ -176,7 +176,7 @@ pub fn with_registry<T>(
 }
 pub fn insert(resource: Resource) -> Result<u64, Error> {
     let handle = NEXT_HANDLE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
         .map_err(|_| Error::argument("Handle identifiers exhausted"))?;

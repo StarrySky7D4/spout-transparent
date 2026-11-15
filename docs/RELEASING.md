@@ -1,6 +1,7 @@
 # Windows 预构建与发布
 
 工作流：.github/workflows/windows-prebuilt.yml。
+CI 当前固定 Rust 1.100.0；升级编译器时需同时确认严格 Clippy 和测试结果。
 
 ## 日常 CI
 

@@ -177,8 +177,10 @@ mod tests {
         bytes[SENDER_NAME_CAPACITY..SENDER_NAME_CAPACITY + 4].copy_from_slice(b"Beta");
 
         let names: Vec<_> = bytes
-            .chunks_exact(SENDER_NAME_CAPACITY)
-            .map_while(SenderName::from_slot)
+            .as_chunks::<SENDER_NAME_CAPACITY>()
+            .0
+            .iter()
+            .map_while(|slot| SenderName::from_slot(slot))
             .map(|name| name.display_name())
             .collect();
         assert_eq!(names, ["Alpha", "Beta"]);

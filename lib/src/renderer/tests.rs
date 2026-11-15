@@ -244,8 +244,10 @@ fn full_screen_draw_and_alpha_readback_preserve_every_pixel() -> windows::core::
     }
     unsafe { context.Unmap(&staging, 0) };
     for (index, (input, output)) in pixels
-        .chunks_exact(4)
-        .zip(actual.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(actual.as_chunks::<4>().0)
         .enumerate()
     {
         for channel in 0..4 {
@@ -274,7 +276,7 @@ fn full_screen_draw_and_alpha_readback_preserve_every_pixel() -> windows::core::
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(alpha.len(), (width * height) as usize);
-        for (input, output) in pixels.chunks_exact(4).zip(&alpha) {
+        for (input, output) in pixels.as_chunks::<4>().0.iter().zip(&alpha) {
             assert!(input[3].abs_diff(*output) <= 1);
         }
     }
