@@ -1,0 +1,187 @@
+name: Windows CI and prebuilt release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-prebuilt-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: Build and verify Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      publish: ${{ steps.release.outputs.publish }}
+    steps:
+      - name: Check out the exact source commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Read the release request
+        id: release
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          $taskRequest = Get-Content -LiteralPath '.github/release.json' -Raw | ConvertFrom-Json
+          $taskTag = [string]$taskRequest.tag
+          if ($taskTag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[0-9]+$') {
+              throw 'Expected a prerelease tag such as v0.1.0-pre.1.'
+          }
+          $taskPublish = $false
+          if ($env:GITHUB_REF -eq 'refs/heads/main') {
+              if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+                  $taskPublish = $true
+              } elseif ($env:GITHUB_EVENT_NAME -eq 'push') {
+                  if ($env:BEFORE_SHA -match '^0{40}$') {
+                      $taskPublish = $true
+                  } else {
+                      $taskChanged = @(& git diff --name-only $env:BEFORE_SHA $env:GITHUB_SHA -- .github/release.json)
+                      if ($LASTEXITCODE -ne 0) { throw 'Cannot determine whether the release request changed.' }
+                      $taskPublish = $taskChanged -contains '.github/release.json'
+                  }
+              }
+          }
+          "tag=$taskTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "publish=$($taskPublish.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Output "Release tag: $taskTag; publish after successful checks: $taskPublish"
+
+      - name: Install Rust stable with formatting and lint tools
+        run: |
+          rustup set default-host x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot select the x64 MSVC host.' }
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain installation failed.' }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot select Rust stable.' }
+          rustc -Vv
+          cargo -V
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Rust tests
+        run: cargo test --workspace --locked
+
+      - name: Run strict Clippy
+        run: cargo clippy --workspace --all-targets --locked --no-deps -- -D warnings
+
+      - name: Build release application and C ABI DLL
+        run: cargo build --workspace --release --locked
+
+      - name: Verify native clients and build the SDK
+        run: |
+          $taskVsWhere = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $taskVsPath = & $taskVsWhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $taskVsPath) { throw 'Visual Studio x64 tools were not found.' }
+          & (Join-Path $taskVsPath 'Common7/Tools/Launch-VsDevShell.ps1') -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          ./lib/c-api/tests/run.ps1 -Configuration Release -SkipGpu
+          ./lib/c-api/build-sdk.ps1 -Configuration Release
+          cmake -S lib/c-api/examples -B target/sdk-example-build -G "Visual Studio 17 2022" -A x64 "-DSPT_SDK_ROOT=$env:GITHUB_WORKSPACE/target/c-api-sdk/release"
+          if ($LASTEXITCODE -ne 0) { throw 'SDK example configuration failed.' }
+          cmake --build target/sdk-example-build --config Release
+          if ($LASTEXITCODE -ne 0) { throw 'SDK example build failed.' }
+          & './target/sdk-example-build/Release/spout_c_example.exe'
+          if ($LASTEXITCODE -ne 0) { throw 'SDK example execution failed.' }
+          $taskDependencies = @()
+          foreach ($taskBinary in @('target/release/spout-transparent.exe', 'target/release/spout_transparent_c.dll')) {
+              $taskDependencies += "Binary: $taskBinary"
+              $taskDependencies += & dumpbin.exe /DEPENDENTS $taskBinary
+              if ($LASTEXITCODE -ne 0) { throw "Cannot inspect dependencies of $taskBinary." }
+          }
+          $taskDependencies | Set-Content -LiteralPath target/runtime-dependencies.txt -Encoding utf8
+
+      - name: Package and verify release archives
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: ./scripts/package-release.ps1 -Tag $env:RELEASE_TAG
+
+      - name: Upload the verified distribution
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-x64-prebuilt-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  publish:
+    name: Publish the prebuilt release
+    needs: build
+    if: >-
+      needs.build.outputs.publish == 'true' &&
+      github.repository == 'StarrySky7D4/spout-transparent' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: prebuilt-release-${{ needs.build.outputs.tag }}
+      cancel-in-progress: false
+    steps:
+      - name: Download this run's verified distribution
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: windows-x64-prebuilt-${{ github.sha }}
+          path: dist
+
+      - name: Verify provenance and publish without overwriting a version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum --check SHA256SUMS.txt
+          test "$(jq -r '.commit' build-info.json)" = "$SOURCE_SHA"
+          test "$(jq -r '.release_tag' build-info.json)" = "$RELEASE_TAG"
+          test "$(jq -r '.target' build-info.json)" = "x86_64-pc-windows-msvc"
+
+          existing_tags="$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$RELEASE_TAG" \
+            --jq "[.[] | select(.ref == \"refs/tags/$RELEASE_TAG\")] | length")"
+          if [ "$existing_tags" != "0" ]; then
+            echo "::error::The release tag already exists; choose a new version instead of moving it."
+            exit 1
+          fi
+          existing_releases="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name')"
+          if grep -Fxq "$RELEASE_TAG" <<< "$existing_releases"; then
+            echo "::error::A release or draft already uses this version; it will not be overwritten."
+            exit 1
+          fi
+
+          gh release create "$RELEASE_TAG" \
+            "spout-transparent-$RELEASE_TAG-windows-x64.zip" \
+            "spout-transparent-sdk-$RELEASE_TAG-windows-x64.zip" \
+            SHA256SUMS.txt build-info.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_SHA" \
+            --title "spout-transparent $RELEASE_TAG (Windows x64 prebuilt)" \
+            --notes-file release-notes.md \
+            --draft --prerelease --latest=false
+
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --draft=false --prerelease --latest=false
+          release_url="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json url --jq .url)"
+          printf '### Published prebuilt release\n\n%s\n' "$release_url" >> "$GITHUB_STEP_SUMMARY"

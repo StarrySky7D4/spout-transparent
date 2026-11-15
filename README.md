@@ -145,6 +145,18 @@ bin/                 spout-transparent-app：透明窗口、托盘、热键应�
 - `action` 可取 `toggle_interaction`、`cycle_framerate`、`toggle_topmost` 或 `quit`。
 - 自定义配置会整体替换默认快捷键；格式错误或快捷键被其他程序占用时，程序会报告错误并退出。
 
+## 预构建下载
+
+Windows x64 预构建包发布在 [GitHub Releases](https://github.com/StarrySky7D4/spout-transparent/releases)：
+
+- 桌面版 ZIP：解压后运行 `spout-transparent.exe`。
+- C/C++ SDK ZIP：包含 DLL、MSVC 导入库、头文件和 CMake 示例。
+- `SHA256SUMS.txt` 与 `build-info.json`：用于核对下载文件及其源码、工具链和 CI 来源。
+
+预构建版使用独立的 `vX.Y.Z-pre.N` 标签并标为预发布。CI 覆盖 Rust 和 C/C++ 非 GPU 测试，
+GPU 共享纹理及桌面交互仍需在实际 Windows 设备验证。下载包内的 `QUICKSTART.txt` 和 Release 说明
+会注明实际运行库依赖。维护者发布和重试流程见 [发布指南](docs/RELEASING.md)。
+
 ## 从源码构建
 
 安装以下环境：

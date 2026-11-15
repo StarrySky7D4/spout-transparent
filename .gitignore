@@ -9,3 +9,4 @@
 .cargo/
 *.log
 debug_*.bmp
+/dist
